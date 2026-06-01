@@ -29,6 +29,14 @@ Open `notebooks/demo.ipynb` and run the cells. The notebook:
 - computes mean AUROC over valid classes,
 - displays one simple saliency heatmap.
 
+For repeated experiments, copy the demo notebook to a local ignored file:
+
+```bash
+cp notebooks/demo.ipynb notebooks/demo_local.ipynb
+```
+
+Then run `notebooks/demo_local.ipynb`. Git ignores `*_local.ipynb` notebooks, so saved outputs will not block `git pull`.
+
 ## Interfaces
 
 `get_small_data()` uses the full ChestMNIST train and validation splits by default:
