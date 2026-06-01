@@ -20,7 +20,13 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 class DictChestMNIST(Dataset):
     def __init__(self, dataset, split_name, max_items=None):
         self.dataset = dataset
-        n_items = len(dataset) if max_items is None else min(max_items, len(dataset))
+        if max_items is None:
+            n_items = len(dataset)
+        elif max_items < 0:
+            raise ValueError("max_items must be None or a non-negative integer.")
+        else:
+            n_items = min(max_items, len(dataset))
+
         self.indices = list(range(n_items))
         self.split_name = split_name
 
@@ -45,7 +51,7 @@ def _class_names():
     return list(label_info)
 
 
-def get_small_data(n_train=100, n_val=30, batch_size=8, image_size=224):
+def get_small_data(n_train=None, n_val=None, batch_size=8, image_size=224):
     transform = transforms.Compose(
         [
             transforms.Resize((image_size, image_size)),

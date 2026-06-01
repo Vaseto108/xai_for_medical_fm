@@ -2,7 +2,7 @@
 
 Minimal project skeleton for studying how adaptation strategies for DINO-style foundation models affect classification performance, efficiency, and explanation quality on chest X-ray tasks.
 
-This first version is intentionally small. It uses ChestMNIST from MedMNIST only as a sanity-check dataset because CheXpert and CheXlocalize need separate access/setup. The final project can swap the data module to CheXpert while keeping the shared loader and prediction interfaces.
+This first version uses ChestMNIST from MedMNIST because CheXpert and CheXlocalize need separate access/setup. The final project can swap the data module to CheXpert while keeping the shared loader and prediction interfaces.
 
 ## Setup
 
@@ -20,7 +20,7 @@ If you are running the demo in Jupyter, install from inside the notebook kernel 
 
 Open `notebooks/demo.ipynb` and run the cells. The notebook:
 
-- downloads a small ChestMNIST subset,
+- downloads ChestMNIST,
 - loads a frozen DINOv2 backbone with a linear multi-label classifier head,
 - reports total and trainable parameter counts,
 - trains the classifier head for a configurable number of epochs,
@@ -30,6 +30,18 @@ Open `notebooks/demo.ipynb` and run the cells. The notebook:
 - displays one simple saliency heatmap.
 
 ## Interfaces
+
+`get_small_data()` uses the full ChestMNIST train and validation splits by default:
+
+```python
+train_loader, val_loader, class_names = get_small_data()
+```
+
+Pass integers for quick sanity checks:
+
+```python
+train_loader, val_loader, class_names = get_small_data(n_train=100, n_val=30)
+```
 
 Data loaders return batches with:
 
@@ -52,6 +64,6 @@ where `probs` and `labels` have shape `[N, C]`.
 ## Notes
 
 - `src/xai.py` currently uses a simple gradient saliency heatmap. Replace this with Grad-CAM, occlusion sensitivity, or attention rollout once the training/adaptation code is in place.
-- `src/eval.py` skips classes with only positives or only negatives when computing mean AUROC, which can happen in tiny subsets.
+- `src/eval.py` skips classes with only positives or only negatives when computing mean AUROC, which can happen when using small subsets.
 - `src/train.py` uses `BCEWithLogitsLoss` for multi-label classification and optimizes only parameters with `requires_grad=True`.
-- The dataset subset is tiny, so metrics from the demo are still mostly an interface check.
+- ChestMNIST is still only a scaffold dataset for this project, so demo metrics should not be treated as final results.
