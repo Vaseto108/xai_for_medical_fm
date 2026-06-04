@@ -18,16 +18,18 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 class DictChestMNIST(Dataset):
-    def __init__(self, dataset, split_name, max_items=None):
+    def __init__(self, dataset, split_name, indices=None, max_items=None):
         self.dataset = dataset
-        if max_items is None:
-            n_items = len(dataset)
-        elif max_items < 0:
-            raise ValueError("max_items must be None or a non-negative integer.")
-        else:
-            n_items = min(max_items, len(dataset))
+        if indices is None:
+            indices = list(range(len(dataset)))
 
-        self.indices = list(range(n_items))
+        if max_items is not None and max_items < 0:
+            raise ValueError("max_items must be None or a non-negative integer.")
+
+        if max_items is not None:
+            indices = indices[:max_items]
+
+        self.indices = list(indices)
         self.split_name = split_name
 
     def __len__(self):
@@ -51,7 +53,32 @@ def _class_names():
     return list(label_info)
 
 
-def get_small_data(n_train=None, n_val=None, batch_size=8, image_size=224):
+def _fraction_indices(n_items, data_fraction, seed):
+    if data_fraction is None:
+        data_fraction = 1.0
+
+    if data_fraction <= 0 or data_fraction > 1:
+        raise ValueError("data_fraction must be in the interval (0, 1].")
+
+    if data_fraction == 1.0:
+        return list(range(n_items))
+
+    n_selected = max(1, int(round(n_items * data_fraction)))
+    generator = torch.Generator().manual_seed(seed)
+    return torch.randperm(n_items, generator=generator)[:n_selected].tolist()
+
+
+def get_small_data(
+    n_train=None,
+    n_val=None,
+    batch_size=8,
+    image_size=224,
+    data_fraction=1.0,
+    seed=0,
+):
+    if data_fraction != 1.0 and (n_train is not None or n_val is not None):
+        raise ValueError("Use either data_fraction or n_train/n_val caps, not both.")
+
     transform = transforms.Compose(
         [
             transforms.Resize((image_size, image_size)),
@@ -73,8 +100,21 @@ def get_small_data(n_train=None, n_val=None, batch_size=8, image_size=224):
         as_rgb=True,
     )
 
-    train_dataset = DictChestMNIST(train_dataset, split_name="train", max_items=n_train)
-    val_dataset = DictChestMNIST(val_dataset, split_name="val", max_items=n_val)
+    train_indices = _fraction_indices(len(train_dataset), data_fraction, seed=seed)
+    val_indices = _fraction_indices(len(val_dataset), data_fraction, seed=seed + 1)
+
+    train_dataset = DictChestMNIST(
+        train_dataset,
+        split_name="train",
+        indices=train_indices,
+        max_items=n_train,
+    )
+    val_dataset = DictChestMNIST(
+        val_dataset,
+        split_name="val",
+        indices=val_indices,
+        max_items=n_val,
+    )
 
     train_loader = DataLoader(
         train_dataset,

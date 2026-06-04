@@ -1,3 +1,7 @@
+import math
+import time
+
+import pandas as pd
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -5,6 +9,30 @@ from tqdm.auto import tqdm
 
 from src.eval import classification_metrics
 from src.model import get_features
+
+
+DEFAULT_KNN_FEWSHOT_SETTINGS = [
+    {"setting": "1-img", "n_train": 1, "k": 1},
+    {"setting": "2-img", "n_train": 2, "k": 1},
+    {"setting": "5-img", "n_train": 5, "k": 3},
+    {"setting": "10-img", "n_train": 10, "k": 5},
+    {"setting": "20-img", "n_train": 20, "k": 5},
+    {"setting": "25-img", "n_train": 25, "k": 5},
+    {"setting": "50-img", "n_train": 50, "k": 10},
+    {"setting": "100-img", "n_train": 100, "k": 20},
+    {"setting": "500-img", "n_train": 500, "k": 50},
+    {"setting": "1000-img", "n_train": 1000, "k": 50},
+    {"setting": "5000-img", "n_train": 5000, "k": 100},
+    {"setting": "full", "n_train": None, "k": 2000},
+]
+
+
+def filter_knn_fewshot_settings(settings, available_train_samples):
+    return [
+        dict(setting)
+        for setting in settings
+        if setting["n_train"] is None or setting["n_train"] <= available_train_samples
+    ]
 
 
 def evaluate_model(model, loader, device, criterion=None):
@@ -123,7 +151,14 @@ def train_model(model, train_loader, val_loader, device, epochs=3, lr=1e-3, weig
     return history
 
 
-def knn_predict(train_features, train_labels, query_features, k=20, batch_size=256, device=None):
+def knn_predict(
+    train_features,
+    train_labels,
+    query_features,
+    k=20,
+    batch_size=256,
+    device=None,
+):
     if k < 1:
         raise ValueError("k must be at least 1.")
 
@@ -135,7 +170,7 @@ def knn_predict(train_features, train_labels, query_features, k=20, batch_size=2
     train_labels = train_labels.float().to(device)
 
     all_probs = []
-    for start in tqdm(range(0, query_features.shape[0], batch_size), desc=f"kNN k={k}", leave=False):
+    for start in range(0, query_features.shape[0], batch_size):
         query_batch = query_features[start : start + batch_size]
         query_batch = F.normalize(query_batch.float(), dim=1).to(device)
 
@@ -146,6 +181,149 @@ def knn_predict(train_features, train_labels, query_features, k=20, batch_size=2
         all_probs.append(probs.cpu())
 
     return torch.cat(all_probs, dim=0)
+
+
+def sample_feature_indices(n_total, n_train, seed):
+    generator = torch.Generator().manual_seed(int(seed))
+    return torch.randperm(n_total, generator=generator)[:n_train]
+
+
+def _with_context(df, context):
+    if not context:
+        return df
+
+    df = df.copy()
+    for key, value in reversed(list(context.items())):
+        df.insert(0, key, value)
+    return df
+
+
+def summarize_knn_runs(runs_df, context=None):
+    summary_df = (
+        runs_df.groupby(
+            ["setting", "n_train", "k", "threshold", "positive_neighbors_needed"],
+            sort=False,
+        )
+        .agg(
+            runs=("setting", "count"),
+            classes_with_positive_train_examples_mean=(
+                "classes_with_positive_train_examples",
+                "mean",
+            ),
+            mean_auc_mean=("mean_auc", "mean"),
+            mean_auc_std=("mean_auc", "std"),
+            f1_macro_mean=("f1_macro", "mean"),
+            f1_macro_std=("f1_macro", "std"),
+            f1_micro_mean=("f1_micro", "mean"),
+            f1_micro_std=("f1_micro", "std"),
+            mean_accuracy_mean=("mean_accuracy", "mean"),
+            exact_match_accuracy_mean=("exact_match_accuracy", "mean"),
+        )
+        .reset_index()
+    )
+    return _with_context(summary_df, context)
+
+
+def run_knn_fewshot_experiment(
+    train_features,
+    train_labels,
+    val_features,
+    val_labels,
+    class_names,
+    settings=None,
+    seeds=None,
+    threshold=0.05,
+    batch_size=256,
+    device=None,
+    context=None,
+):
+    if settings is None:
+        settings = DEFAULT_KNN_FEWSHOT_SETTINGS
+    if seeds is None:
+        seeds = list(range(10))
+    if class_names is None:
+        class_names = [f"class_{idx}" for idx in range(val_labels.shape[1])]
+
+    result_rows = []
+    per_class_full_rows = []
+    n_total = train_features.shape[0]
+
+    start = time.perf_counter()
+
+    for config in filter_knn_fewshot_settings(settings, n_total):
+        setting = config["setting"]
+        n_train = config["n_train"]
+        requested_k = config["k"]
+        run_seeds = ["full"] if n_train is None else seeds
+
+        for seed in run_seeds:
+            if n_train is None:
+                indices = torch.arange(n_total)
+            else:
+                indices = sample_feature_indices(n_total, n_train, seed)
+
+            subset_features = train_features[indices]
+            subset_labels = train_labels[indices]
+            n_train_actual = subset_features.shape[0]
+            k_effective = min(requested_k, n_train_actual)
+            positive_neighbors_needed = math.ceil(k_effective * threshold)
+
+            probs = knn_predict(
+                train_features=subset_features,
+                train_labels=subset_labels,
+                query_features=val_features,
+                k=k_effective,
+                batch_size=batch_size,
+                device=device,
+            )
+            metrics = classification_metrics(probs, val_labels, threshold=threshold)
+            preds = (probs >= threshold).float()
+            positive_counts = subset_labels.sum(dim=0)
+
+            result_rows.append(
+                {
+                    "setting": setting,
+                    "seed": seed,
+                    "n_train": n_train_actual,
+                    "k": k_effective,
+                    "threshold": threshold,
+                    "positive_neighbors_needed": positive_neighbors_needed,
+                    "neighbor_fraction": k_effective / n_train_actual,
+                    "classes_with_positive_train_examples": int((positive_counts > 0).sum().item()),
+                    "mean_auc": metrics["mean_auc"],
+                    "mean_accuracy": metrics["mean_accuracy"],
+                    "exact_match_accuracy": metrics["exact_match_accuracy"],
+                    "f1_macro": metrics["f1_macro"],
+                    "f1_micro": metrics["f1_micro"],
+                }
+            )
+
+            if setting == "full":
+                for class_idx, class_name in enumerate(class_names):
+                    per_class_full_rows.append(
+                        {
+                            "class_name": class_name,
+                            "true_positive_rate": float(val_labels[:, class_idx].mean().item()),
+                            "predicted_positive_rate": float(preds[:, class_idx].mean().item()),
+                            "accuracy": metrics["accuracy_per_class"][class_idx],
+                            "f1": metrics["f1_per_class"][class_idx],
+                            "auc": metrics["auc_per_class"][class_idx],
+                        }
+                    )
+
+    knn_eval_seconds = time.perf_counter() - start
+
+    runs_df = _with_context(pd.DataFrame(result_rows), context)
+    summary_df = summarize_knn_runs(pd.DataFrame(result_rows), context=context)
+    per_class_full_df = _with_context(pd.DataFrame(per_class_full_rows), context)
+    metadata = {"knn_eval_seconds": float(knn_eval_seconds)}
+
+    return {
+        "runs": runs_df,
+        "summary": summary_df,
+        "per_class_full": per_class_full_df,
+        "metadata": metadata,
+    }
 
 
 def evaluate_knn_baseline(model, train_loader, val_loader, device, k=20, batch_size=256):

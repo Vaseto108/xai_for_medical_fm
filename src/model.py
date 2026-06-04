@@ -1,3 +1,5 @@
+import time
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -92,6 +94,62 @@ def get_features(model, loader, device, normalize=True):
     features = torch.cat(all_features, dim=0)
     labels = torch.cat(all_labels, dim=0)
     return features, labels, all_ids
+
+
+def model_metadata(model):
+    return {
+        "total_params": count_total_params(model),
+        "trainable_params": count_trainable_params(model),
+    }
+
+
+def _is_cuda_device(device):
+    return torch.device(device).type == "cuda" and torch.cuda.is_available()
+
+
+def extract_feature_bank(model, train_loader, val_loader, device, class_names=None, normalize=True):
+    if _is_cuda_device(device):
+        torch.cuda.reset_peak_memory_stats(device)
+
+    start = time.perf_counter()
+    train_features, train_labels, train_ids = get_features(
+        model,
+        train_loader,
+        device,
+        normalize=normalize,
+    )
+    train_feature_seconds = time.perf_counter() - start
+
+    start = time.perf_counter()
+    val_features, val_labels, val_ids = get_features(
+        model,
+        val_loader,
+        device,
+        normalize=normalize,
+    )
+    val_feature_seconds = time.perf_counter() - start
+
+    peak_gpu_memory_mb = None
+    if _is_cuda_device(device):
+        peak_gpu_memory_mb = torch.cuda.max_memory_allocated(device) / 1024**2
+
+    feature_bank = {
+        "train_features": train_features,
+        "train_labels": train_labels,
+        "train_ids": train_ids,
+        "val_features": val_features,
+        "val_labels": val_labels,
+        "val_ids": val_ids,
+        "class_names": class_names,
+    }
+    metadata = {
+        "feature_dim": int(train_features.shape[1]),
+        "train_feature_seconds": float(train_feature_seconds),
+        "val_feature_seconds": float(val_feature_seconds),
+        "feature_extraction_seconds": float(train_feature_seconds + val_feature_seconds),
+        "peak_gpu_memory_mb": None if peak_gpu_memory_mb is None else float(peak_gpu_memory_mb),
+    }
+    return feature_bank, metadata
 
 
 def count_trainable_params(model):
