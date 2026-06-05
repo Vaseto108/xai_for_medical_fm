@@ -703,7 +703,13 @@ def run_linear_probe_grid(
     total_threshold_search_seconds = 0.0
     head_metadata = None
 
-    for trial_idx, config in enumerate(configs):
+    config_progress = tqdm(
+        list(enumerate(configs)),
+        desc="Linear probe configs",
+        leave=True,
+        disable=not show_progress,
+    )
+    for trial_idx, config in config_progress:
         train_trial_id = f"train_trial_{trial_idx:03d}"
         train_context = {
             **(context or {}),
@@ -711,6 +717,11 @@ def run_linear_probe_grid(
             "lr": float(config["lr"]),
             "weight_decay": float(config["weight_decay"]),
         }
+        if show_progress:
+            config_progress.set_postfix(
+                lr=float(config["lr"]),
+                weight_decay=float(config["weight_decay"]),
+            )
 
         _set_torch_seed(seed + trial_idx)
         model = get_feature_linear_probe(feature_dim, num_classes).to(device)
@@ -950,6 +961,7 @@ def knn_predict(
     k=20,
     batch_size=256,
     device=None,
+    show_progress=False,
 ):
     if k < 1:
         raise ValueError("k must be at least 1.")
@@ -962,7 +974,14 @@ def knn_predict(
     train_labels = train_labels.float().to(device)
 
     all_probs = []
-    for start in range(0, query_features.shape[0], batch_size):
+    batch_starts = range(0, query_features.shape[0], batch_size)
+    progress = tqdm(
+        batch_starts,
+        desc="kNN query batches",
+        leave=False,
+        disable=not show_progress,
+    )
+    for start in progress:
         query_batch = query_features[start : start + batch_size]
         query_batch = F.normalize(query_batch.float(), dim=1).to(device)
 
@@ -1028,6 +1047,7 @@ def run_knn_fewshot_experiment(
     batch_size=256,
     device=None,
     context=None,
+    show_progress=False,
 ):
     if settings is None:
         settings = DEFAULT_KNN_FEWSHOT_SETTINGS
@@ -1042,11 +1062,21 @@ def run_knn_fewshot_experiment(
 
     start = time.perf_counter()
 
-    for config in filter_knn_fewshot_settings(settings, n_total):
+    settings_to_run = filter_knn_fewshot_settings(settings, n_total)
+    progress = tqdm(
+        settings_to_run,
+        desc="kNN settings",
+        leave=False,
+        disable=not show_progress,
+    )
+    for config in progress:
         setting = config["setting"]
         n_train = config["n_train"]
         requested_k = config["k"]
         run_seeds = ["full"] if n_train is None else seeds
+
+        if show_progress:
+            progress.set_postfix(setting=setting)
 
         for seed in run_seeds:
             if n_train is None:
@@ -1067,6 +1097,7 @@ def run_knn_fewshot_experiment(
                 k=k_effective,
                 batch_size=batch_size,
                 device=device,
+                show_progress=show_progress,
             )
             metrics = classification_metrics(probs, val_labels, threshold=threshold)
             preds = (probs >= threshold).float()
