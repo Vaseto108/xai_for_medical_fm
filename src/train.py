@@ -34,6 +34,37 @@ DEFAULT_KNN_FEWSHOT_SETTINGS = [
 ]
 
 
+def make_knn_search_settings(base_settings=None, k_values=None):
+    """Expand kNN few-shot settings with candidate ``k`` values.
+
+    ``k`` changes the neighbor vote itself, so it is part of the kNN evaluation
+    grid. The original ``k`` from each base setting is always kept.
+    """
+
+    if base_settings is None:
+        base_settings = DEFAULT_KNN_FEWSHOT_SETTINGS
+    if k_values is None:
+        return [dict(setting) for setting in base_settings]
+
+    settings = []
+    for base_setting in base_settings:
+        n_train = base_setting["n_train"]
+        candidate_k_values = {int(base_setting["k"])}
+        candidate_k_values.update(int(k) for k in k_values)
+
+        for k in sorted(candidate_k_values):
+            if k < 1:
+                raise ValueError("All k values must be at least 1.")
+            if n_train is not None and k > n_train:
+                continue
+
+            setting = dict(base_setting)
+            setting["k"] = int(k)
+            settings.append(setting)
+
+    return settings
+
+
 def filter_knn_fewshot_settings(settings, available_train_samples):
     return [
         dict(setting)
@@ -994,6 +1025,57 @@ def knn_predict(
     return torch.cat(all_probs, dim=0)
 
 
+def knn_predict_for_k_values(
+    train_features,
+    train_labels,
+    query_features,
+    k_values,
+    batch_size=256,
+    device=None,
+    show_progress=False,
+):
+    """Predict kNN probabilities for several ``k`` values in one top-k pass."""
+
+    if device is None:
+        device = train_features.device
+
+    k_values = sorted({int(k) for k in k_values})
+    if not k_values:
+        raise ValueError("At least one k value is required.")
+    if min(k_values) < 1:
+        raise ValueError("All k values must be at least 1.")
+
+    max_available_k = int(train_features.shape[0])
+    effective_k_values = sorted({min(k, max_available_k) for k in k_values})
+    max_k = max(effective_k_values)
+
+    train_features = F.normalize(train_features.float(), dim=1).to(device)
+    train_labels = train_labels.float().to(device)
+
+    probs_by_k = {k: [] for k in effective_k_values}
+    batch_starts = range(0, query_features.shape[0], batch_size)
+    progress = tqdm(
+        batch_starts,
+        desc="kNN query batches",
+        leave=False,
+        disable=not show_progress,
+    )
+    for start in progress:
+        query_batch = query_features[start : start + batch_size]
+        query_batch = F.normalize(query_batch.float(), dim=1).to(device)
+
+        similarities = query_batch @ train_features.T
+        neighbor_indices = similarities.topk(k=max_k, dim=1).indices
+        neighbor_labels = train_labels[neighbor_indices]
+        cumulative_neighbor_labels = neighbor_labels.cumsum(dim=1)
+
+        for k in effective_k_values:
+            probs = cumulative_neighbor_labels[:, k - 1, :] / k
+            probs_by_k[k].append(probs.cpu())
+
+    return {k: torch.cat(parts, dim=0) for k, parts in probs_by_k.items()}
+
+
 def sample_feature_indices(n_total, n_train, seed):
     generator = torch.Generator().manual_seed(int(seed))
     return torch.randperm(n_total, generator=generator)[:n_train]
@@ -1044,6 +1126,7 @@ def run_knn_fewshot_experiment(
     settings=None,
     seeds=None,
     threshold=0.05,
+    thresholds=None,
     batch_size=256,
     device=None,
     context=None,
@@ -1055,24 +1138,43 @@ def run_knn_fewshot_experiment(
         seeds = list(range(10))
     if class_names is None:
         class_names = [f"class_{idx}" for idx in range(val_labels.shape[1])]
+    if thresholds is None:
+        thresholds = [threshold]
+    thresholds = [float(value) for value in thresholds]
+    if not thresholds:
+        raise ValueError("At least one threshold is required.")
 
     result_rows = []
     per_class_full_rows = []
     n_total = train_features.shape[0]
 
     start = time.perf_counter()
+    knn_query_seconds = 0.0
+    threshold_search_seconds_total = 0.0
 
     settings_to_run = filter_knn_fewshot_settings(settings, n_total)
+    grouped_settings = []
+    grouped_lookup = {}
+    for config in settings_to_run:
+        key = (config["setting"], config["n_train"])
+        if key not in grouped_lookup:
+            grouped_lookup[key] = {
+                "setting": config["setting"],
+                "n_train": config["n_train"],
+                "k_values": [],
+            }
+            grouped_settings.append(grouped_lookup[key])
+        grouped_lookup[key]["k_values"].append(int(config["k"]))
+
     progress = tqdm(
-        settings_to_run,
-        desc="kNN settings",
+        grouped_settings,
+        desc="kNN reference sets",
         leave=False,
         disable=not show_progress,
     )
-    for config in progress:
-        setting = config["setting"]
-        n_train = config["n_train"]
-        requested_k = config["k"]
+    for config_group in progress:
+        setting = config_group["setting"]
+        n_train = config_group["n_train"]
         run_seeds = ["full"] if n_train is None else seeds
 
         if show_progress:
@@ -1087,59 +1189,91 @@ def run_knn_fewshot_experiment(
             subset_features = train_features[indices]
             subset_labels = train_labels[indices]
             n_train_actual = subset_features.shape[0]
-            k_effective = min(requested_k, n_train_actual)
-            positive_neighbors_needed = math.ceil(k_effective * threshold)
+            k_values = sorted({min(k, n_train_actual) for k in config_group["k_values"]})
 
-            probs = knn_predict(
+            query_start = time.perf_counter()
+            probs_by_k = knn_predict_for_k_values(
                 train_features=subset_features,
                 train_labels=subset_labels,
                 query_features=val_features,
-                k=k_effective,
+                k_values=k_values,
                 batch_size=batch_size,
                 device=device,
                 show_progress=show_progress,
             )
-            metrics = classification_metrics(probs, val_labels, threshold=threshold)
-            preds = (probs >= threshold).float()
+            knn_query_seconds += time.perf_counter() - query_start
             positive_counts = subset_labels.sum(dim=0)
 
-            result_rows.append(
-                {
-                    "setting": setting,
-                    "seed": seed,
-                    "n_train": n_train_actual,
-                    "k": k_effective,
-                    "threshold": threshold,
-                    "positive_neighbors_needed": positive_neighbors_needed,
-                    "neighbor_fraction": k_effective / n_train_actual,
-                    "classes_with_positive_train_examples": int((positive_counts > 0).sum().item()),
-                    "mean_auc": metrics["mean_auc"],
-                    "mean_accuracy": metrics["mean_accuracy"],
-                    "exact_match_accuracy": metrics["exact_match_accuracy"],
-                    "f1_macro": metrics["f1_macro"],
-                    "f1_micro": metrics["f1_micro"],
-                }
-            )
+            for k_effective, probs in probs_by_k.items():
+                threshold_start = time.perf_counter()
+                for threshold_value in thresholds:
+                    positive_neighbors_needed = math.ceil(k_effective * threshold_value)
+                    metrics = classification_metrics(
+                        probs,
+                        val_labels,
+                        threshold=threshold_value,
+                    )
+                    preds = (probs >= threshold_value).float()
 
-            if setting == "full":
-                for class_idx, class_name in enumerate(class_names):
-                    per_class_full_rows.append(
+                    result_rows.append(
                         {
-                            "class_name": class_name,
-                            "true_positive_rate": float(val_labels[:, class_idx].mean().item()),
-                            "predicted_positive_rate": float(preds[:, class_idx].mean().item()),
-                            "accuracy": metrics["accuracy_per_class"][class_idx],
-                            "f1": metrics["f1_per_class"][class_idx],
-                            "auc": metrics["auc_per_class"][class_idx],
+                            "setting": setting,
+                            "seed": seed,
+                            "n_train": n_train_actual,
+                            "k": k_effective,
+                            "threshold": threshold_value,
+                            "positive_neighbors_needed": positive_neighbors_needed,
+                            "neighbor_fraction": k_effective / n_train_actual,
+                            "classes_with_positive_train_examples": int(
+                                (positive_counts > 0).sum().item()
+                            ),
+                            "mean_auc": metrics["mean_auc"],
+                            "mean_accuracy": metrics["mean_accuracy"],
+                            "exact_match_accuracy": metrics["exact_match_accuracy"],
+                            "f1_macro": metrics["f1_macro"],
+                            "f1_micro": metrics["f1_micro"],
                         }
                     )
+
+                    if setting == "full":
+                        for class_idx, class_name in enumerate(class_names):
+                            per_class_full_rows.append(
+                                {
+                                    "setting": setting,
+                                    "seed": seed,
+                                    "n_train": n_train_actual,
+                                    "k": k_effective,
+                                    "threshold": threshold_value,
+                                    "positive_neighbors_needed": positive_neighbors_needed,
+                                    "class_name": class_name,
+                                    "true_positive_rate": float(
+                                        val_labels[:, class_idx].mean().item()
+                                    ),
+                                    "predicted_positive_rate": float(
+                                        preds[:, class_idx].mean().item()
+                                    ),
+                                    "accuracy": metrics["accuracy_per_class"][class_idx],
+                                    "f1": metrics["f1_per_class"][class_idx],
+                                    "auc": metrics["auc_per_class"][class_idx],
+                                }
+                            )
+
+                threshold_search_seconds_total += time.perf_counter() - threshold_start
 
     knn_eval_seconds = time.perf_counter() - start
 
     runs_df = _with_context(pd.DataFrame(result_rows), context)
     summary_df = summarize_knn_runs(pd.DataFrame(result_rows), context=context)
     per_class_full_df = _with_context(pd.DataFrame(per_class_full_rows), context)
-    metadata = {"knn_eval_seconds": float(knn_eval_seconds)}
+    metadata = {
+        "knn_eval_seconds": float(knn_eval_seconds),
+        "knn_query_seconds": float(knn_query_seconds),
+        "threshold_search_seconds": float(threshold_search_seconds_total),
+        "num_knn_settings": len(settings_to_run),
+        "num_reference_set_groups": len(grouped_settings),
+        "num_thresholds": len(thresholds),
+        "thresholds": thresholds,
+    }
 
     return {
         "runs": runs_df,
