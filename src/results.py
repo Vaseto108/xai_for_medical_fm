@@ -77,3 +77,43 @@ def load_knn_outputs(run_dir):
         "per_class_full": pd.read_csv(run_dir / "per_class_full.csv"),
         "metadata": metadata,
     }
+
+
+def save_linear_probe_outputs(
+    run_dir,
+    history_df,
+    summary_df,
+    per_class_df,
+    metadata=None,
+    trials_df=None,
+):
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    history_df.to_csv(run_dir / "history.csv", index=False)
+    summary_df.to_csv(run_dir / "summary.csv", index=False)
+    per_class_df.to_csv(run_dir / "per_class.csv", index=False)
+    if trials_df is not None:
+        trials_df.to_csv(run_dir / "trials.csv", index=False)
+
+    with open(run_dir / "metadata.json", "w", encoding="utf-8") as handle:
+        json.dump(metadata or {}, handle, indent=2)
+
+
+def load_linear_probe_outputs(run_dir):
+    run_dir = Path(run_dir)
+
+    with open(run_dir / "metadata.json", "r", encoding="utf-8") as handle:
+        metadata = json.load(handle)
+
+    return {
+        "history": pd.read_csv(run_dir / "history.csv"),
+        "summary": pd.read_csv(run_dir / "summary.csv"),
+        "per_class": pd.read_csv(run_dir / "per_class.csv"),
+        "trials": (
+            pd.read_csv(run_dir / "trials.csv")
+            if (run_dir / "trials.csv").exists()
+            else None
+        ),
+        "metadata": metadata,
+    }

@@ -24,12 +24,30 @@ class DinoClassifier(nn.Module):
             for param in self.backbone.parameters():
                 param.requires_grad = False
 
+    def _backbone_is_frozen(self):
+        return not any(param.requires_grad for param in self.backbone.parameters())
+
     def extract_features(self, images):
-        outputs = self.backbone(pixel_values=images)
+        if self._backbone_is_frozen():
+            with torch.no_grad():
+                outputs = self.backbone(pixel_values=images)
+        else:
+            outputs = self.backbone(pixel_values=images)
         return _pool_dino_outputs(outputs)
 
     def forward(self, images):
         features = self.extract_features(images)
+        return self.classifier(features)
+
+
+class FeatureLinearProbe(nn.Module):
+    """Linear multi-label classifier trained on frozen backbone features."""
+
+    def __init__(self, feature_dim, num_classes):
+        super().__init__()
+        self.classifier = nn.Linear(feature_dim, num_classes)
+
+    def forward(self, features):
         return self.classifier(features)
 
 
@@ -41,12 +59,54 @@ def get_dino_model(num_classes, model_name="facebook/dinov2-small", freeze_backb
     )
 
 
+def get_feature_linear_probe(feature_dim, num_classes):
+    return FeatureLinearProbe(feature_dim=feature_dim, num_classes=num_classes)
+
+
 def get_dino_backbone(model_name="facebook/dinov2-small", freeze=True):
     model = AutoModel.from_pretrained(model_name)
     if freeze:
         for param in model.parameters():
             param.requires_grad = False
     return model
+
+
+def unfreeze_last_blocks(model, num_blocks=1, train_classifier=True):
+    """Planned helper for partial fine-tuning of DINO-style models.
+
+    The future implementation should freeze the backbone by default, then
+    unfreeze the last ``num_blocks`` transformer blocks. If ``model`` is a
+    DinoClassifier, ``train_classifier=True`` should keep its linear head
+    trainable.
+
+    Returns:
+        The same model with updated ``requires_grad`` flags.
+    """
+
+    raise NotImplementedError(
+        "Partial fine-tuning is planned but unfreeze_last_blocks is not implemented yet."
+    )
+
+
+def apply_lora_adapters(
+    model,
+    target_modules=None,
+    rank=8,
+    alpha=16,
+    dropout=0.0,
+):
+    """Planned PEFT/LoRA modification helper for DINO-style backbones.
+
+    TODO:
+    - choose target modules for DINOv2/DINOv3/RAD-DINO attention projections,
+    - add PEFT/LoRA adapters without changing the classifier interface,
+    - leave only adapter parameters and the classifier head trainable.
+
+    Returns:
+        The model with LoRA adapters attached.
+    """
+
+    raise NotImplementedError("LoRA adapters are planned but not implemented yet.")
 
 
 def get_probs(model, loader, device):
