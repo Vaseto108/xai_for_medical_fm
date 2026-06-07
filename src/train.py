@@ -7,7 +7,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
-from tqdm import tqdm
+from tqdm.notebook import tqdm
 
 from src.eval import (
     classification_metrics,
@@ -770,7 +770,7 @@ def run_linear_probe_grid(
             lr=float(config["lr"]),
             weight_decay=float(config["weight_decay"]),
             batch_size=batch_size,
-            show_progress=False,
+            show_progress=show_progress,
         )
         train_wall_seconds = time.perf_counter() - train_start
         head_train_seconds = sum(row["train_epoch_seconds"] for row in history)
@@ -1169,7 +1169,7 @@ def run_knn_fewshot_experiment(
     progress = tqdm(
         grouped_settings,
         desc="kNN reference sets",
-        leave=True,
+        leave=False,
         disable=not show_progress,
     )
     for config_group in progress:
@@ -1199,7 +1199,7 @@ def run_knn_fewshot_experiment(
                 k_values=k_values,
                 batch_size=batch_size,
                 device=device,
-                show_progress=False,
+                show_progress=show_progress,
             )
             knn_query_seconds += time.perf_counter() - query_start
             positive_counts = subset_labels.sum(dim=0)

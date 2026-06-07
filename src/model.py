@@ -3,7 +3,7 @@ import time
 import torch
 from torch import nn
 from torch.nn import functional as F
-from tqdm import tqdm
+from tqdm.notebook import tqdm
 from transformers import AutoModel
 
 
@@ -128,14 +128,14 @@ def get_probs(model, loader, device):
     return probs, labels, all_ids
 
 
-def get_features(model, loader, device, normalize=True, progress_desc="Extracting features"):
+def get_features(model, loader, device, normalize=True):
     model.eval()
     all_features = []
     all_labels = []
     all_ids = []
 
     with torch.no_grad():
-        for batch in tqdm(loader, desc=progress_desc, leave=True):
+        for batch in loader:
             images = batch["images"].to(device)
 
             if hasattr(model, "extract_features"):
@@ -177,7 +177,6 @@ def extract_feature_bank(model, train_loader, val_loader, device, class_names=No
         train_loader,
         device,
         normalize=normalize,
-        progress_desc="Extracting train features",
     )
     train_feature_seconds = time.perf_counter() - start
 
@@ -187,7 +186,6 @@ def extract_feature_bank(model, train_loader, val_loader, device, class_names=No
         val_loader,
         device,
         normalize=normalize,
-        progress_desc="Extracting validation features",
     )
     val_feature_seconds = time.perf_counter() - start
 
