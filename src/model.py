@@ -71,21 +71,69 @@ def get_dino_backbone(model_name="facebook/dinov2-small", freeze=True):
     return model
 
 
-def unfreeze_last_blocks(model, num_blocks=1, train_classifier=True):
-    """Planned helper for partial fine-tuning of DINO-style models.
+def transformer_block_info(model):
+    """Return the backbone block container and final normalization layer."""
 
-    The future implementation should freeze the backbone by default, then
-    unfreeze the last ``num_blocks`` transformer blocks. If ``model`` is a
-    DinoClassifier, ``train_classifier=True`` should keep its linear head
-    trainable.
+    backbone = model.backbone if isinstance(model, DinoClassifier) else model
+
+    if hasattr(backbone, "encoder") and hasattr(backbone.encoder, "layer"):
+        return {
+            "backbone": backbone,
+            "blocks": backbone.encoder.layer,
+            "block_path": "backbone.encoder.layer",
+            "final_norm": backbone.layernorm,
+            "final_norm_path": "backbone.layernorm",
+        }
+
+    if hasattr(backbone, "layer") and hasattr(backbone, "norm"):
+        return {
+            "backbone": backbone,
+            "blocks": backbone.layer,
+            "block_path": "backbone.layer",
+            "final_norm": backbone.norm,
+            "final_norm_path": "backbone.norm",
+        }
+
+    raise ValueError(
+        f"Unsupported backbone structure for partial fine-tuning: {type(backbone).__name__}"
+    )
+
+
+def unfreeze_last_blocks(model, num_blocks=1, train_classifier=True):
+    """Freeze the model, then unfreeze its final transformer blocks.
+
+    The final backbone normalization layer is also unfrozen because it directly
+    transforms the representation consumed by the classifier.
 
     Returns:
         The same model with updated ``requires_grad`` flags.
     """
 
-    raise NotImplementedError(
-        "Partial fine-tuning is planned but unfreeze_last_blocks is not implemented yet."
-    )
+    block_info = transformer_block_info(model)
+    blocks = block_info["blocks"]
+    num_blocks = int(num_blocks)
+
+    if num_blocks < 1 or num_blocks > len(blocks):
+        raise ValueError(
+            f"num_blocks must be between 1 and {len(blocks)} for "
+            f"{type(block_info['backbone']).__name__}."
+        )
+
+    for param in model.parameters():
+        param.requires_grad = False
+
+    for block in blocks[-num_blocks:]:
+        for param in block.parameters():
+            param.requires_grad = True
+
+    for param in block_info["final_norm"].parameters():
+        param.requires_grad = True
+
+    if train_classifier and isinstance(model, DinoClassifier):
+        for param in model.classifier.parameters():
+            param.requires_grad = True
+
+    return model
 
 
 def apply_lora_adapters(

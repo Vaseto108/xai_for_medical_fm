@@ -117,3 +117,29 @@ def load_linear_probe_outputs(run_dir):
         ),
         "metadata": metadata,
     }
+
+
+def save_partial_finetune_outputs(
+    run_dir,
+    history_df,
+    summary_df,
+    per_class_df,
+    metadata=None,
+    trials_df=None,
+):
+    """Save compact partial-fine-tuning tables without model checkpoints."""
+
+    save_linear_probe_outputs(
+        run_dir,
+        history_df=history_df,
+        summary_df=summary_df,
+        per_class_df=per_class_df,
+        metadata=metadata,
+        trials_df=trials_df,
+    )
+
+
+def load_partial_finetune_outputs(run_dir):
+    """Load compact partial-fine-tuning result tables."""
+
+    return load_linear_probe_outputs(run_dir)

@@ -1,3 +1,4 @@
+import gc
 import itertools
 import math
 import time
@@ -15,7 +16,14 @@ from src.eval import (
     per_class_metric_table,
     threshold_metric_table,
 )
-from src.model import get_feature_linear_probe, get_features, model_metadata
+from src.model import (
+    get_dino_model,
+    get_feature_linear_probe,
+    get_features,
+    model_metadata,
+    transformer_block_info,
+    unfreeze_last_blocks,
+)
 
 
 DEFAULT_KNN_FEWSHOT_SETTINGS = [
@@ -278,15 +286,21 @@ def train_partial_finetune(
     lr=1e-5,
     weight_decay=0.0,
 ):
-    """Planned partial fine-tuning workflow.
+    """Train one model after unfreezing its final transformer blocks."""
 
-    The future implementation should configure the model with
-    ``src.model.unfreeze_last_blocks`` and then call ``train_model``.
-    """
-
-    raise NotImplementedError(
-        "Partial fine-tuning is planned but train_partial_finetune is not implemented yet."
+    unfreeze_last_blocks(model, num_blocks=num_unfrozen_blocks)
+    history, _ = train_partial_finetune_checkpoints(
+        model,
+        train_loader,
+        val_loader,
+        device,
+        checkpoint_epochs=[epochs],
+        backbone_lr=lr,
+        head_lr=lr,
+        weight_decay=weight_decay,
+        show_progress=True,
     )
+    return history
 
 
 def train_lora(
@@ -332,6 +346,32 @@ def make_linear_probe_grid(
         if epochs is not None:
             config["checkpoint_epochs"] = [int(epoch) for epoch in epochs]
         grid.append(config)
+    return grid
+
+
+def make_partial_finetune_grid(
+    num_unfrozen_blocks=(1, 2, 3, 4, 5),
+    backbone_lrs=(1e-6, 3e-6, 1e-5),
+    weight_decays=(1e-4, 1e-2),
+    head_lr_multiplier=10.0,
+):
+    """Create a Cartesian grid for block-count-controlled partial fine-tuning."""
+
+    grid = []
+    for num_blocks, backbone_lr, weight_decay in itertools.product(
+        num_unfrozen_blocks,
+        backbone_lrs,
+        weight_decays,
+    ):
+        grid.append(
+            {
+                "num_unfrozen_blocks": int(num_blocks),
+                "backbone_lr": float(backbone_lr),
+                "head_lr": float(backbone_lr * head_lr_multiplier),
+                "head_lr_multiplier": float(head_lr_multiplier),
+                "weight_decay": float(weight_decay),
+            }
+        )
     return grid
 
 
@@ -389,6 +429,265 @@ def _set_torch_seed(seed):
     torch.manual_seed(int(seed))
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(int(seed))
+
+
+def _partial_finetune_grid_configs(train_grid):
+    if train_grid is None:
+        return make_partial_finetune_grid()
+
+    if isinstance(train_grid, dict):
+        keys = list(train_grid)
+        grid_values = [
+            value if isinstance(value, (list, tuple)) else [value]
+            for value in train_grid.values()
+        ]
+        configs = [
+            dict(zip(keys, config_values))
+            for config_values in itertools.product(*grid_values)
+        ]
+    else:
+        configs = [dict(config) for config in train_grid]
+
+    normalized = []
+    for config in configs:
+        backbone_lr = float(config["backbone_lr"])
+        head_lr_multiplier = float(config.get("head_lr_multiplier", 10.0))
+        normalized.append(
+            {
+                "num_unfrozen_blocks": int(config["num_unfrozen_blocks"]),
+                "backbone_lr": backbone_lr,
+                "head_lr": float(config.get("head_lr", backbone_lr * head_lr_multiplier)),
+                "head_lr_multiplier": head_lr_multiplier,
+                "weight_decay": float(config["weight_decay"]),
+            }
+        )
+    return normalized
+
+
+def _dedupe_partial_finetune_configs(configs):
+    deduped = []
+    seen = set()
+    for config in configs:
+        key = (
+            int(config["num_unfrozen_blocks"]),
+            float(config["backbone_lr"]),
+            float(config["head_lr"]),
+            float(config["weight_decay"]),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(dict(config))
+    return deduped
+
+
+def _amp_enabled(device, use_amp):
+    return bool(use_amp and _is_cuda_device(device))
+
+
+def _partial_finetune_optimizer(model, backbone_lr, head_lr, weight_decay):
+    head_params = [param for param in model.classifier.parameters() if param.requires_grad]
+    head_param_ids = {id(param) for param in head_params}
+    backbone_params = [
+        param
+        for param in model.parameters()
+        if param.requires_grad and id(param) not in head_param_ids
+    ]
+
+    if not backbone_params:
+        raise ValueError("Partial fine-tuning requires trainable backbone parameters.")
+    if not head_params:
+        raise ValueError("Partial fine-tuning requires a trainable classifier head.")
+
+    return torch.optim.AdamW(
+        [
+            {"params": backbone_params, "lr": float(backbone_lr)},
+            {"params": head_params, "lr": float(head_lr)},
+        ],
+        weight_decay=float(weight_decay),
+    )
+
+
+def evaluate_image_classifier(
+    model,
+    loader,
+    device,
+    criterion=None,
+    threshold=0.5,
+    use_amp=True,
+):
+    """Evaluate an image classifier, optionally using CUDA mixed precision."""
+
+    model.eval()
+    total_loss = 0.0
+    n_samples = 0
+    all_probs = []
+    all_labels = []
+    amp_enabled = _amp_enabled(device, use_amp)
+
+    with torch.no_grad():
+        for batch in loader:
+            images = batch["images"].to(device)
+            labels = batch["labels"].float().to(device)
+
+            with torch.cuda.amp.autocast(enabled=amp_enabled):
+                logits = model(images)
+                loss = criterion(logits, labels) if criterion is not None else None
+
+            if loss is not None:
+                batch_size_actual = images.size(0)
+                total_loss += loss.item() * batch_size_actual
+                n_samples += batch_size_actual
+
+            all_probs.append(torch.sigmoid(logits).cpu())
+            all_labels.append(labels.cpu())
+
+    probs = torch.cat(all_probs, dim=0)
+    labels = torch.cat(all_labels, dim=0)
+    metrics = classification_metrics(probs, labels, threshold=threshold)
+    metrics["loss"] = total_loss / n_samples if criterion is not None and n_samples else None
+    return metrics, probs, labels
+
+
+def train_partial_finetune_checkpoints(
+    model,
+    train_loader,
+    val_loader,
+    device,
+    checkpoint_epochs,
+    backbone_lr=1e-5,
+    head_lr=1e-4,
+    weight_decay=1e-4,
+    use_amp=True,
+    show_progress=False,
+):
+    """Train one partially unfrozen image classifier and evaluate checkpoints."""
+
+    checkpoint_epochs = sorted({int(epoch) for epoch in checkpoint_epochs})
+    max_epochs = max(checkpoint_epochs)
+    checkpoint_set = set(checkpoint_epochs)
+    amp_enabled = _amp_enabled(device, use_amp)
+
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = _partial_finetune_optimizer(
+        model,
+        backbone_lr=backbone_lr,
+        head_lr=head_lr,
+        weight_decay=weight_decay,
+    )
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+
+    history = []
+    checkpoints = {}
+
+    epoch_progress = tqdm(
+        range(1, max_epochs + 1),
+        desc="Current partial fine-tune",
+        leave=False,
+        disable=not show_progress,
+    )
+    for epoch in epoch_progress:
+        epoch_start = time.perf_counter()
+        train_start = time.perf_counter()
+        model.train()
+        total_loss = 0.0
+        n_samples = 0
+        train_probs = []
+        train_targets = []
+
+        for batch in train_loader:
+            images = batch["images"].to(device)
+            labels = batch["labels"].float().to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.cuda.amp.autocast(enabled=amp_enabled):
+                logits = model(images)
+                loss = criterion(logits, labels)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            batch_size_actual = images.size(0)
+            total_loss += loss.item() * batch_size_actual
+            n_samples += batch_size_actual
+            probs = torch.sigmoid(logits.detach())
+            train_probs.append(probs.cpu())
+            train_targets.append(labels.cpu())
+
+        train_epoch_seconds = time.perf_counter() - train_start
+        train_loss = total_loss / n_samples
+        train_metrics = classification_metrics(
+            torch.cat(train_probs, dim=0),
+            torch.cat(train_targets, dim=0),
+        )
+
+        val_metrics = None
+        val_probs = None
+        val_targets = None
+        val_eval_seconds = 0.0
+        if epoch in checkpoint_set:
+            val_start = time.perf_counter()
+            val_metrics, val_probs, val_targets = evaluate_image_classifier(
+                model,
+                val_loader,
+                device,
+                criterion=criterion,
+                use_amp=use_amp,
+            )
+            val_eval_seconds = time.perf_counter() - val_start
+        epoch_seconds = time.perf_counter() - epoch_start
+
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "train_mean_accuracy": train_metrics["mean_accuracy"],
+                "train_f1_macro": train_metrics["f1_macro"],
+                "train_f1_micro": train_metrics["f1_micro"],
+                "is_checkpoint": epoch in checkpoint_set,
+                "val_loss": val_metrics["loss"] if val_metrics is not None else float("nan"),
+                "val_mean_auc": (
+                    val_metrics["mean_auc"] if val_metrics is not None else float("nan")
+                ),
+                "val_mean_accuracy": (
+                    val_metrics["mean_accuracy"] if val_metrics is not None else float("nan")
+                ),
+                "val_exact_match_accuracy": (
+                    val_metrics["exact_match_accuracy"]
+                    if val_metrics is not None
+                    else float("nan")
+                ),
+                "val_f1_macro": (
+                    val_metrics["f1_macro"] if val_metrics is not None else float("nan")
+                ),
+                "val_f1_micro": (
+                    val_metrics["f1_micro"] if val_metrics is not None else float("nan")
+                ),
+                "train_epoch_seconds": float(train_epoch_seconds),
+                "val_eval_seconds": float(val_eval_seconds),
+                "epoch_seconds": float(epoch_seconds),
+            }
+        )
+
+        if epoch in checkpoint_set:
+            checkpoints[epoch] = {
+                "metrics": val_metrics,
+                "probs": val_probs,
+                "labels": val_targets,
+                "val_eval_seconds": float(val_eval_seconds),
+            }
+
+        if show_progress:
+            progress_metrics = {"train_loss": f"{train_loss:.4f}"}
+            if val_metrics is not None:
+                progress_metrics.update(
+                    val_auc=f"{val_metrics['mean_auc']:.4f}",
+                    val_f1=f"{val_metrics['f1_macro']:.4f}",
+                )
+            epoch_progress.set_postfix(progress_metrics)
+
+    return history, checkpoints
 
 
 def evaluate_feature_classifier(
@@ -682,6 +981,349 @@ def _best_row(df, metric):
     return sortable.sort_values(sort_columns, ascending=False).iloc[0].drop(
         labels=["_selection_metric"]
     )
+
+
+def _run_partial_finetune_stage(
+    stage,
+    configs,
+    model_name,
+    num_classes,
+    train_loader,
+    val_loader,
+    device,
+    checkpoint_epochs,
+    thresholds,
+    seed,
+    context,
+    use_amp,
+    gradient_checkpointing,
+    show_progress,
+):
+    trial_frames = []
+    history_frames = []
+    probs_by_checkpoint = {}
+    labels_by_checkpoint = {}
+    timing = {
+        "model_init_seconds": 0.0,
+        "partial_train_seconds": 0.0,
+        "val_eval_seconds": 0.0,
+        "threshold_search_seconds": 0.0,
+    }
+
+    config_progress = tqdm(
+        list(enumerate(configs)),
+        desc=f"Partial fine-tune {stage} configs",
+        leave=True,
+        disable=not show_progress,
+    )
+    for trial_idx, config in config_progress:
+        train_trial_id = f"{stage}_train_trial_{trial_idx:03d}"
+        train_context = {
+            **(context or {}),
+            "stage": stage,
+            "train_trial_id": train_trial_id,
+            **config,
+        }
+        if show_progress:
+            config_progress.set_postfix(
+                blocks=config["num_unfrozen_blocks"],
+                backbone_lr=config["backbone_lr"],
+                weight_decay=config["weight_decay"],
+            )
+
+        _set_torch_seed(seed)
+        model_init_start = time.perf_counter()
+        model = get_dino_model(
+            num_classes=num_classes,
+            model_name=model_name,
+            freeze_backbone=True,
+        )
+        unfreeze_last_blocks(model, num_blocks=config["num_unfrozen_blocks"])
+        block_info = transformer_block_info(model)
+        if gradient_checkpointing:
+            model.backbone.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+        model = model.to(device)
+        model_init_seconds = time.perf_counter() - model_init_start
+        timing["model_init_seconds"] += model_init_seconds
+        trial_model_metadata = model_metadata(model)
+
+        train_start = time.perf_counter()
+        history, checkpoints = train_partial_finetune_checkpoints(
+            model,
+            train_loader,
+            val_loader,
+            device,
+            checkpoint_epochs=checkpoint_epochs,
+            backbone_lr=config["backbone_lr"],
+            head_lr=config["head_lr"],
+            weight_decay=config["weight_decay"],
+            use_amp=use_amp,
+            show_progress=show_progress,
+        )
+        train_wall_seconds = time.perf_counter() - train_start
+        train_seconds = sum(row["train_epoch_seconds"] for row in history)
+        val_eval_seconds = sum(row["val_eval_seconds"] for row in history)
+        timing["partial_train_seconds"] += train_seconds
+        timing["val_eval_seconds"] += val_eval_seconds
+
+        for epoch, checkpoint in checkpoints.items():
+            checkpoint_id = f"{train_trial_id}_epoch_{epoch:03d}"
+            checkpoint_context = {
+                **train_context,
+                "trial_id": checkpoint_id,
+                "epoch": int(epoch),
+                "epochs": int(epoch),
+            }
+            threshold_start = time.perf_counter()
+            trial_df = threshold_metric_table(
+                checkpoint["probs"],
+                checkpoint["labels"],
+                thresholds,
+                context=checkpoint_context,
+            )
+            threshold_search_seconds = time.perf_counter() - threshold_start
+            timing["threshold_search_seconds"] += threshold_search_seconds
+
+            trial_df["loss"] = checkpoint["metrics"]["loss"]
+            trial_df["model_init_seconds"] = float(model_init_seconds)
+            trial_df["partial_train_seconds"] = float(train_seconds)
+            trial_df["train_wall_seconds"] = float(train_wall_seconds)
+            trial_df["checkpoint_eval_seconds"] = float(checkpoint["val_eval_seconds"])
+            trial_df["threshold_search_seconds"] = float(threshold_search_seconds)
+            trial_df["total_params"] = int(trial_model_metadata["total_params"])
+            trial_df["trainable_params"] = int(trial_model_metadata["trainable_params"])
+            trial_df["trainable_param_fraction"] = float(
+                trial_model_metadata["trainable_params"] / trial_model_metadata["total_params"]
+            )
+            trial_df["total_transformer_blocks"] = len(block_info["blocks"])
+            trial_df["block_path"] = block_info["block_path"]
+            trial_df["final_norm_path"] = block_info["final_norm_path"]
+            trial_frames.append(trial_df)
+
+            checkpoint_key = (train_trial_id, int(epoch))
+            probs_by_checkpoint[checkpoint_key] = checkpoint["probs"]
+            labels_by_checkpoint[checkpoint_key] = checkpoint["labels"]
+
+        history_frames.append(_with_context(pd.DataFrame(history), train_context))
+
+        del model
+        gc.collect()
+        if _is_cuda_device(device):
+            torch.cuda.empty_cache()
+
+    timing["counted_seconds"] = float(sum(timing.values()))
+    return {
+        "history": pd.concat(history_frames, ignore_index=True),
+        "trials": pd.concat(trial_frames, ignore_index=True),
+        "probs_by_checkpoint": probs_by_checkpoint,
+        "labels_by_checkpoint": labels_by_checkpoint,
+        "timing": timing,
+    }
+
+
+def run_partial_finetune_grid(
+    model_name,
+    num_classes,
+    train_loader,
+    val_loader,
+    device,
+    class_names=None,
+    train_grid=None,
+    checkpoint_epochs=None,
+    search_checkpoint_epochs=None,
+    thresholds=None,
+    selection_metric="f1_macro",
+    seed=0,
+    context=None,
+    use_amp=True,
+    gradient_checkpointing=True,
+    show_progress=False,
+):
+    """Search short partial fine-tunes, then retrain the selected config fully.
+
+    The search stage compares every block/LR/weight-decay configuration using
+    short checkpoint epochs. The selected structural/training configuration is
+    then initialized from scratch and trained through ``checkpoint_epochs``.
+    Search, final-run, and total measured costs are all returned explicitly.
+    """
+
+    thresholds = thresholds if thresholds is not None else [0.05, 0.1, 0.2, 0.3, 0.5]
+    raw_configs = _partial_finetune_grid_configs(train_grid)
+    final_checkpoint_epochs = _checkpoint_epochs(raw_configs, checkpoint_epochs)
+    if search_checkpoint_epochs is None:
+        search_checkpoint_epochs = [1, 2, 3, 5, 7, 10]
+    search_checkpoint_epochs = _checkpoint_epochs([], search_checkpoint_epochs)
+    configs = _dedupe_partial_finetune_configs(raw_configs)
+    if class_names is None:
+        class_names = [f"class_{idx}" for idx in range(num_classes)]
+
+    _reset_peak_memory(device)
+
+    search_result = _run_partial_finetune_stage(
+        stage="search",
+        configs=configs,
+        model_name=model_name,
+        num_classes=num_classes,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        device=device,
+        checkpoint_epochs=search_checkpoint_epochs,
+        thresholds=thresholds,
+        seed=seed,
+        context=context,
+        use_amp=use_amp,
+        gradient_checkpointing=gradient_checkpointing,
+        show_progress=show_progress,
+    )
+    search_best = _best_row(search_result["trials"], selection_metric)
+    selected_config = {
+        "num_unfrozen_blocks": int(search_best["num_unfrozen_blocks"]),
+        "backbone_lr": float(search_best["backbone_lr"]),
+        "head_lr": float(search_best["head_lr"]),
+        "head_lr_multiplier": float(search_best["head_lr_multiplier"]),
+        "weight_decay": float(search_best["weight_decay"]),
+    }
+
+    final_result = _run_partial_finetune_stage(
+        stage="final",
+        configs=[selected_config],
+        model_name=model_name,
+        num_classes=num_classes,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        device=device,
+        checkpoint_epochs=final_checkpoint_epochs,
+        thresholds=thresholds,
+        seed=seed,
+        context=context,
+        use_amp=use_amp,
+        gradient_checkpointing=gradient_checkpointing,
+        show_progress=show_progress,
+    )
+    final_best = _best_row(final_result["trials"], selection_metric)
+
+    best_train_trial_id = final_best["train_trial_id"]
+    best_trial_id = final_best["trial_id"]
+    best_epoch = int(final_best["epoch"])
+    best_threshold = float(final_best["threshold"])
+    best_context = {
+        **(context or {}),
+        "stage": "final",
+        "train_trial_id": best_train_trial_id,
+        "trial_id": best_trial_id,
+        "epoch": best_epoch,
+        "epochs": best_epoch,
+        **selected_config,
+        "threshold": best_threshold,
+        "selection_metric": selection_metric,
+    }
+    checkpoint_key = (best_train_trial_id, best_epoch)
+    per_class_df = per_class_metric_table(
+        final_result["probs_by_checkpoint"][checkpoint_key],
+        final_result["labels_by_checkpoint"][checkpoint_key],
+        class_names=class_names,
+        threshold=best_threshold,
+        context=best_context,
+    )
+
+    search_timing = search_result["timing"]
+    final_timing = final_result["timing"]
+    total_model_init_seconds = (
+        search_timing["model_init_seconds"] + final_timing["model_init_seconds"]
+    )
+    total_train_seconds = (
+        search_timing["partial_train_seconds"] + final_timing["partial_train_seconds"]
+    )
+    total_val_eval_seconds = (
+        search_timing["val_eval_seconds"] + final_timing["val_eval_seconds"]
+    )
+    total_threshold_search_seconds = (
+        search_timing["threshold_search_seconds"]
+        + final_timing["threshold_search_seconds"]
+    )
+
+    efficiency = efficiency_summary(
+        adaptation_method="partial_finetune",
+        total_params=int(final_best["total_params"]),
+        trainable_params=int(final_best["trainable_params"]),
+        phase_seconds={
+            "model_init_grid": total_model_init_seconds,
+            "partial_train_grid": total_train_seconds,
+            "val_eval_grid": total_val_eval_seconds,
+            "threshold_search_grid": total_threshold_search_seconds,
+        },
+        peak_gpu_memory_mb=_peak_memory_mb(device),
+    )
+
+    metadata = {
+        **(context or {}),
+        **efficiency,
+        "selection_protocol": "short_grid_search_then_fresh_final_retrain",
+        "search_seed_policy": "same_seed_for_all_configs",
+        "training_seed": int(seed),
+        "selection_metric": selection_metric,
+        "num_train_trials": len(configs) + 1,
+        "num_search_train_trials": len(configs),
+        "num_final_train_trials": 1,
+        "num_epoch_checkpoints": len(final_checkpoint_epochs),
+        "num_search_epoch_checkpoints": len(search_checkpoint_epochs),
+        "num_final_epoch_checkpoints": len(final_checkpoint_epochs),
+        "num_thresholds": len(thresholds),
+        "num_total_metric_rows": (
+            len(configs) * len(search_checkpoint_epochs) * len(thresholds)
+            + len(final_checkpoint_epochs) * len(thresholds)
+        ),
+        "search_checkpoint_epochs": search_checkpoint_epochs,
+        "checkpoint_epochs": final_checkpoint_epochs,
+        "search_model_init_seconds": search_timing["model_init_seconds"],
+        "search_partial_train_seconds": search_timing["partial_train_seconds"],
+        "search_val_eval_seconds": search_timing["val_eval_seconds"],
+        "search_threshold_search_seconds": search_timing["threshold_search_seconds"],
+        "search_counted_seconds": search_timing["counted_seconds"],
+        "final_model_init_seconds": final_timing["model_init_seconds"],
+        "final_partial_train_seconds": final_timing["partial_train_seconds"],
+        "final_val_eval_seconds": final_timing["val_eval_seconds"],
+        "final_threshold_search_seconds": final_timing["threshold_search_seconds"],
+        "final_counted_seconds": final_timing["counted_seconds"],
+        "use_amp": bool(_amp_enabled(device, use_amp)),
+        "gradient_checkpointing": bool(gradient_checkpointing),
+        "gradient_checkpointing_use_reentrant": False if gradient_checkpointing else None,
+        "search_selected_trial_id": search_best["trial_id"],
+        "search_selected_train_trial_id": search_best["train_trial_id"],
+        "search_selected_epoch": int(search_best["epoch"]),
+        "search_selected_threshold": float(search_best["threshold"]),
+        "search_selected_metric_value": float(search_best[selection_metric]),
+        "selected_trial_id": best_trial_id,
+        "selected_train_trial_id": best_train_trial_id,
+        "selected_epoch": best_epoch,
+        "selected_epochs": best_epoch,
+        "selected_num_unfrozen_blocks": int(final_best["num_unfrozen_blocks"]),
+        "selected_backbone_lr": float(final_best["backbone_lr"]),
+        "selected_head_lr": float(final_best["head_lr"]),
+        "selected_head_lr_multiplier": float(final_best["head_lr_multiplier"]),
+        "selected_weight_decay": float(final_best["weight_decay"]),
+        "selected_threshold": best_threshold,
+        "selected_metric_value": float(final_best[selection_metric]),
+        "selected_total_transformer_blocks": int(final_best["total_transformer_blocks"]),
+        "selected_block_path": final_best["block_path"],
+        "selected_final_norm_path": final_best["final_norm_path"],
+    }
+
+    return {
+        "history": pd.concat(
+            [search_result["history"], final_result["history"]],
+            ignore_index=True,
+        ),
+        "trials": pd.concat(
+            [search_result["trials"], final_result["trials"]],
+            ignore_index=True,
+        ),
+        "summary": pd.DataFrame([final_best.to_dict()]),
+        "per_class": per_class_df,
+        "metadata": metadata,
+    }
 
 
 def run_linear_probe_grid(
