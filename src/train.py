@@ -1,5 +1,7 @@
 import gc
+import hashlib
 import itertools
+import json
 import math
 import time
 
@@ -23,6 +25,12 @@ from src.model import (
     model_metadata,
     transformer_block_info,
     unfreeze_last_blocks,
+)
+from src.results import (
+    load_partial_finetune_checkpoint,
+    load_partial_finetune_progress,
+    save_partial_finetune_checkpoint,
+    save_partial_finetune_progress,
 )
 
 
@@ -350,9 +358,9 @@ def make_linear_probe_grid(
 
 
 def make_partial_finetune_grid(
-    num_unfrozen_blocks=(1, 2, 3, 4, 5),
-    backbone_lrs=(1e-6, 3e-6, 1e-5),
-    weight_decays=(1e-4, 1e-2),
+    num_unfrozen_blocks=(1, 2),
+    backbone_lrs=(1e-6, 3e-6),
+    weight_decays=(1e-4,),
     head_lr_multiplier=10.0,
 ):
     """Create a Cartesian grid for block-count-controlled partial fine-tuning."""
@@ -560,6 +568,7 @@ def train_partial_finetune_checkpoints(
     weight_decay=1e-4,
     use_amp=True,
     show_progress=False,
+    checkpoint_callback=None,
 ):
     """Train one partially unfrozen image classifier and evaluate checkpoints."""
 
@@ -677,6 +686,8 @@ def train_partial_finetune_checkpoints(
                 "labels": val_targets,
                 "val_eval_seconds": float(val_eval_seconds),
             }
+            if checkpoint_callback is not None:
+                checkpoint_callback(epoch, checkpoints[epoch])
 
         if show_progress:
             progress_metrics = {"train_loss": f"{train_loss:.4f}"}
@@ -983,6 +994,57 @@ def _best_row(df, metric):
     )
 
 
+def _partial_finetune_config_key(stage, config):
+    return (
+        f"{stage}_blocks_{int(config['num_unfrozen_blocks'])}"
+        f"_backbone_lr_{float(config['backbone_lr']):g}"
+        f"_head_lr_{float(config['head_lr']):g}"
+        f"_wd_{float(config['weight_decay']):g}"
+    )
+
+
+def _partial_finetune_signature(
+    model_name,
+    num_classes,
+    configs,
+    search_checkpoint_epochs,
+    final_checkpoint_epochs,
+    thresholds,
+    selection_metric,
+    seed,
+    context,
+):
+    payload = {
+        "model_name": model_name,
+        "num_classes": int(num_classes),
+        "configs": configs,
+        "search_checkpoint_epochs": search_checkpoint_epochs,
+        "final_checkpoint_epochs": final_checkpoint_epochs,
+        "thresholds": [float(value) for value in thresholds],
+        "selection_metric": selection_metric,
+        "seed": int(seed),
+        "context": context or {},
+    }
+    serialized = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
+
+
+def _trainable_state_dict(model):
+    trainable_names = {
+        name for name, parameter in model.named_parameters() if parameter.requires_grad
+    }
+    return {
+        name: tensor.detach().cpu()
+        for name, tensor in model.state_dict().items()
+        if name in trainable_names
+    }
+
+
+def _concat_frames(frames):
+    frames = [frame for frame in frames if frame is not None and not frame.empty]
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
 def _run_partial_finetune_stage(
     stage,
     configs,
@@ -998,9 +1060,16 @@ def _run_partial_finetune_stage(
     use_amp,
     gradient_checkpointing,
     show_progress,
+    selection_metric,
+    progress_run_dir=None,
+    experiment_signature=None,
+    completed_results_df=None,
+    completed_history_df=None,
+    completed_trials_df=None,
 ):
-    trial_frames = []
-    history_frames = []
+    trial_frames = [completed_trials_df]
+    history_frames = [completed_history_df]
+    result_frames = [completed_results_df]
     probs_by_checkpoint = {}
     labels_by_checkpoint = {}
     timing = {
@@ -1009,6 +1078,14 @@ def _run_partial_finetune_stage(
         "val_eval_seconds": 0.0,
         "threshold_search_seconds": 0.0,
     }
+    completed_config_keys = set()
+    if completed_results_df is not None and not completed_results_df.empty:
+        completed_config_keys = set(
+            completed_results_df.loc[
+                completed_results_df["stage"] == stage,
+                "config_key",
+            ]
+        )
 
     config_progress = tqdm(
         list(enumerate(configs)),
@@ -1018,10 +1095,15 @@ def _run_partial_finetune_stage(
     )
     for trial_idx, config in config_progress:
         train_trial_id = f"{stage}_train_trial_{trial_idx:03d}"
+        config_key = _partial_finetune_config_key(stage, config)
+        if config_key in completed_config_keys:
+            continue
+
         train_context = {
             **(context or {}),
             "stage": stage,
             "train_trial_id": train_trial_id,
+            "config_key": config_key,
             **config,
         }
         if show_progress:
@@ -1048,8 +1130,51 @@ def _run_partial_finetune_stage(
         model_init_seconds = time.perf_counter() - model_init_start
         timing["model_init_seconds"] += model_init_seconds
         trial_model_metadata = model_metadata(model)
+        best_checkpoint_key = None
+        best_checkpoint_path = None
 
         train_start = time.perf_counter()
+
+        def save_best_checkpoint(epoch, checkpoint):
+            nonlocal best_checkpoint_key, best_checkpoint_path
+
+            checkpoint_thresholds_df = threshold_metric_table(
+                checkpoint["probs"],
+                checkpoint["labels"],
+                thresholds,
+            )
+            checkpoint_best = _best_row(checkpoint_thresholds_df, selection_metric)
+            checkpoint_key = tuple(
+                float(checkpoint_best[metric])
+                for metric in [selection_metric, "f1_macro", "f1_micro", "mean_accuracy"]
+            )
+            if math.isnan(checkpoint_key[0]) or (
+                best_checkpoint_key is not None and checkpoint_key <= best_checkpoint_key
+            ):
+                return
+            best_checkpoint_key = checkpoint_key
+            if progress_run_dir is None:
+                return
+
+            best_checkpoint_path = save_partial_finetune_checkpoint(
+                progress_run_dir,
+                checkpoint_name=f"{config_key}_best",
+                payload={
+                    "model_name": model_name,
+                    "stage": stage,
+                    "config_key": config_key,
+                    "train_trial_id": train_trial_id,
+                    "epoch": int(epoch),
+                    "selection_metric": selection_metric,
+                    "selection_metric_value": checkpoint_key[0],
+                    "selected_threshold": float(checkpoint_best["threshold"]),
+                    "config": config,
+                    "trainable_state_dict": _trainable_state_dict(model),
+                    "probs": checkpoint["probs"],
+                    "labels": checkpoint["labels"],
+                },
+            )
+
         history, checkpoints = train_partial_finetune_checkpoints(
             model,
             train_loader,
@@ -1061,10 +1186,12 @@ def _run_partial_finetune_stage(
             weight_decay=config["weight_decay"],
             use_amp=use_amp,
             show_progress=show_progress,
+            checkpoint_callback=save_best_checkpoint,
         )
         train_wall_seconds = time.perf_counter() - train_start
         train_seconds = sum(row["train_epoch_seconds"] for row in history)
         val_eval_seconds = sum(row["val_eval_seconds"] for row in history)
+        config_threshold_search_seconds = 0.0
         timing["partial_train_seconds"] += train_seconds
         timing["val_eval_seconds"] += val_eval_seconds
 
@@ -1084,6 +1211,7 @@ def _run_partial_finetune_stage(
                 context=checkpoint_context,
             )
             threshold_search_seconds = time.perf_counter() - threshold_start
+            config_threshold_search_seconds += threshold_search_seconds
             timing["threshold_search_seconds"] += threshold_search_seconds
 
             trial_df["loss"] = checkpoint["metrics"]["loss"]
@@ -1100,6 +1228,9 @@ def _run_partial_finetune_stage(
             trial_df["total_transformer_blocks"] = len(block_info["blocks"])
             trial_df["block_path"] = block_info["block_path"]
             trial_df["final_norm_path"] = block_info["final_norm_path"]
+            trial_df["checkpoint_path"] = (
+                str(best_checkpoint_path) if best_checkpoint_path is not None else None
+            )
             trial_frames.append(trial_df)
 
             checkpoint_key = (train_trial_id, int(epoch))
@@ -1107,16 +1238,98 @@ def _run_partial_finetune_stage(
             labels_by_checkpoint[checkpoint_key] = checkpoint["labels"]
 
         history_frames.append(_with_context(pd.DataFrame(history), train_context))
+        current_trials_df = pd.concat(
+            [frame for frame in trial_frames if frame is not None and not frame.empty],
+            ignore_index=True,
+        )
+        config_trials_df = current_trials_df[
+            current_trials_df["config_key"] == config_key
+        ]
+        config_best = _best_row(config_trials_df, selection_metric)
+        result_frames.append(
+            pd.DataFrame(
+                [
+                    {
+                        "model_key": (context or {}).get(
+                            "run_name",
+                            (context or {}).get("model_key", model_name),
+                        ),
+                        "adaptation_method": "partial_finetune",
+                        "stage": stage,
+                        "config_key": config_key,
+                        "train_trial_id": train_trial_id,
+                        "selection_metric": selection_metric,
+                        "num_unfrozen_blocks": int(config_best["num_unfrozen_blocks"]),
+                        "backbone_lr": float(config_best["backbone_lr"]),
+                        "head_lr": float(config_best["head_lr"]),
+                        "weight_decay": float(config_best["weight_decay"]),
+                        "best_epoch": int(config_best["epoch"]),
+                        "threshold": float(config_best["threshold"]),
+                        "mean_auc": float(config_best["mean_auc"]),
+                        "f1_macro": float(config_best["f1_macro"]),
+                        "f1_micro": float(config_best["f1_micro"]),
+                        "train_time_seconds": float(train_seconds),
+                        "model_init_seconds": float(model_init_seconds),
+                        "val_eval_seconds": float(val_eval_seconds),
+                        "threshold_search_seconds": float(
+                            config_threshold_search_seconds
+                        ),
+                        "train_wall_seconds": float(train_wall_seconds),
+                        "trainable_params": int(config_best["trainable_params"]),
+                        "total_params": int(config_best["total_params"]),
+                        "checkpoint_path": (
+                            str(best_checkpoint_path)
+                            if best_checkpoint_path is not None
+                            else None
+                        ),
+                    }
+                ]
+            )
+        )
+
+        if progress_run_dir is not None:
+            cumulative_results_df = _concat_frames(result_frames)
+            stage_results_df = cumulative_results_df[
+                cumulative_results_df["stage"] == stage
+            ]
+            current_best_df = pd.DataFrame(
+                [_best_row(stage_results_df, selection_metric).to_dict()]
+            )
+            save_partial_finetune_progress(
+                progress_run_dir,
+                history_df=_concat_frames(history_frames),
+                trials_df=current_trials_df,
+                results_df=cumulative_results_df,
+                current_best_df=current_best_df,
+                metadata={
+                    "experiment_signature": experiment_signature,
+                    "selection_metric": selection_metric,
+                    "completed_configs": int(len(cumulative_results_df)),
+                    "current_stage": stage,
+                },
+            )
 
         del model
         gc.collect()
         if _is_cuda_device(device):
             torch.cuda.empty_cache()
 
+    cumulative_results_df = _concat_frames(result_frames)
+    stage_results_df = cumulative_results_df[cumulative_results_df["stage"] == stage]
+    if not stage_results_df.empty:
+        timing = {
+            "model_init_seconds": float(stage_results_df["model_init_seconds"].sum()),
+            "partial_train_seconds": float(stage_results_df["train_time_seconds"].sum()),
+            "val_eval_seconds": float(stage_results_df["val_eval_seconds"].sum()),
+            "threshold_search_seconds": float(
+                stage_results_df["threshold_search_seconds"].sum()
+            ),
+        }
     timing["counted_seconds"] = float(sum(timing.values()))
     return {
-        "history": pd.concat(history_frames, ignore_index=True),
-        "trials": pd.concat(trial_frames, ignore_index=True),
+        "history": _concat_frames(history_frames),
+        "trials": _concat_frames(trial_frames),
+        "results": cumulative_results_df,
         "probs_by_checkpoint": probs_by_checkpoint,
         "labels_by_checkpoint": labels_by_checkpoint,
         "timing": timing,
@@ -1134,12 +1347,13 @@ def run_partial_finetune_grid(
     checkpoint_epochs=None,
     search_checkpoint_epochs=None,
     thresholds=None,
-    selection_metric="f1_macro",
+    selection_metric="mean_auc",
     seed=0,
     context=None,
     use_amp=True,
     gradient_checkpointing=True,
     show_progress=False,
+    progress_run_dir=None,
 ):
     """Search short partial fine-tunes, then retrain the selected config fully.
 
@@ -1153,13 +1367,32 @@ def run_partial_finetune_grid(
     raw_configs = _partial_finetune_grid_configs(train_grid)
     final_checkpoint_epochs = _checkpoint_epochs(raw_configs, checkpoint_epochs)
     if search_checkpoint_epochs is None:
-        search_checkpoint_epochs = [1, 2, 3, 5, 7, 10]
+        search_checkpoint_epochs = [1, 3, 5]
     search_checkpoint_epochs = _checkpoint_epochs([], search_checkpoint_epochs)
     configs = _dedupe_partial_finetune_configs(raw_configs)
     if class_names is None:
         class_names = [f"class_{idx}" for idx in range(num_classes)]
 
     _reset_peak_memory(device)
+    experiment_signature = _partial_finetune_signature(
+        model_name=model_name,
+        num_classes=num_classes,
+        configs=configs,
+        search_checkpoint_epochs=search_checkpoint_epochs,
+        final_checkpoint_epochs=final_checkpoint_epochs,
+        thresholds=thresholds,
+        selection_metric=selection_metric,
+        seed=seed,
+        context=context,
+    )
+    progress = (
+        load_partial_finetune_progress(progress_run_dir, experiment_signature)
+        if progress_run_dir is not None
+        else None
+    )
+    completed_history_df = progress["history"] if progress is not None else None
+    completed_trials_df = progress["trials"] if progress is not None else None
+    completed_results_df = progress["results"] if progress is not None else None
 
     search_result = _run_partial_finetune_stage(
         stage="search",
@@ -1176,8 +1409,16 @@ def run_partial_finetune_grid(
         use_amp=use_amp,
         gradient_checkpointing=gradient_checkpointing,
         show_progress=show_progress,
+        selection_metric=selection_metric,
+        progress_run_dir=progress_run_dir,
+        experiment_signature=experiment_signature,
+        completed_results_df=completed_results_df,
+        completed_history_df=completed_history_df,
+        completed_trials_df=completed_trials_df,
     )
-    search_best = _best_row(search_result["trials"], selection_metric)
+    search_trials_df = search_result["trials"]
+    search_trials_df = search_trials_df[search_trials_df["stage"] == "search"]
+    search_best = _best_row(search_trials_df, selection_metric)
     selected_config = {
         "num_unfrozen_blocks": int(search_best["num_unfrozen_blocks"]),
         "backbone_lr": float(search_best["backbone_lr"]),
@@ -1201,8 +1442,16 @@ def run_partial_finetune_grid(
         use_amp=use_amp,
         gradient_checkpointing=gradient_checkpointing,
         show_progress=show_progress,
+        selection_metric=selection_metric,
+        progress_run_dir=progress_run_dir,
+        experiment_signature=experiment_signature,
+        completed_results_df=search_result["results"],
+        completed_history_df=search_result["history"],
+        completed_trials_df=search_result["trials"],
     )
-    final_best = _best_row(final_result["trials"], selection_metric)
+    final_trials_df = final_result["trials"]
+    final_trials_df = final_trials_df[final_trials_df["stage"] == "final"]
+    final_best = _best_row(final_trials_df, selection_metric)
 
     best_train_trial_id = final_best["train_trial_id"]
     best_trial_id = final_best["trial_id"]
@@ -1220,6 +1469,13 @@ def run_partial_finetune_grid(
         "selection_metric": selection_metric,
     }
     checkpoint_key = (best_train_trial_id, best_epoch)
+    if checkpoint_key not in final_result["probs_by_checkpoint"]:
+        checkpoint_path = final_best.get("checkpoint_path")
+        if not checkpoint_path:
+            raise ValueError("Selected final checkpoint predictions are unavailable.")
+        checkpoint_payload = load_partial_finetune_checkpoint(checkpoint_path)
+        final_result["probs_by_checkpoint"][checkpoint_key] = checkpoint_payload["probs"]
+        final_result["labels_by_checkpoint"][checkpoint_key] = checkpoint_payload["labels"]
     per_class_df = per_class_metric_table(
         final_result["probs_by_checkpoint"][checkpoint_key],
         final_result["labels_by_checkpoint"][checkpoint_key],
@@ -1312,14 +1568,8 @@ def run_partial_finetune_grid(
     }
 
     return {
-        "history": pd.concat(
-            [search_result["history"], final_result["history"]],
-            ignore_index=True,
-        ),
-        "trials": pd.concat(
-            [search_result["trials"], final_result["trials"]],
-            ignore_index=True,
-        ),
+        "history": final_result["history"],
+        "trials": final_result["trials"],
         "summary": pd.DataFrame([final_best.to_dict()]),
         "per_class": per_class_df,
         "metadata": metadata,
@@ -1334,7 +1584,7 @@ def run_linear_probe_grid(
     checkpoint_epochs=None,
     thresholds=None,
     batch_size=256,
-    selection_metric="f1_macro",
+    selection_metric="mean_auc",
     seed=0,
     backbone_metadata=None,
     context=None,

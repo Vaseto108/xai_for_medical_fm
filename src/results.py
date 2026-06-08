@@ -143,3 +143,90 @@ def load_partial_finetune_outputs(run_dir):
     """Load compact partial-fine-tuning result tables."""
 
     return load_linear_probe_outputs(run_dir)
+
+
+def partial_finetune_progress_dir(run_dir):
+    return Path(run_dir) / "_progress"
+
+
+def load_partial_finetune_progress(run_dir, experiment_signature):
+    """Load compatible per-config partial-fine-tuning progress tables."""
+
+    progress_dir = partial_finetune_progress_dir(run_dir)
+    metadata_path = progress_dir / "metadata.json"
+    if not metadata_path.exists():
+        return None
+
+    with open(metadata_path, "r", encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    if metadata.get("experiment_signature") != experiment_signature:
+        return None
+
+    def read_csv(name):
+        path = progress_dir / name
+        return pd.read_csv(path) if path.exists() else pd.DataFrame()
+
+    return {
+        "history": read_csv("history.csv"),
+        "trials": read_csv("trials.csv"),
+        "results": read_csv("partial_finetune_results.csv"),
+        "metadata": metadata,
+    }
+
+
+def save_partial_finetune_progress(
+    run_dir,
+    history_df,
+    trials_df,
+    results_df,
+    current_best_df,
+    metadata,
+):
+    """Save cumulative partial-fine-tuning tables after a completed config."""
+
+    progress_dir = partial_finetune_progress_dir(run_dir)
+    progress_dir.mkdir(parents=True, exist_ok=True)
+
+    history_df.to_csv(progress_dir / "history.csv", index=False)
+    trials_df.to_csv(progress_dir / "trials.csv", index=False)
+    results_df.to_csv(progress_dir / "partial_finetune_results.csv", index=False)
+    current_best_df.to_csv(progress_dir / "current_best.csv", index=False)
+    current_best_df.to_json(
+        progress_dir / "current_best.json",
+        orient="records",
+        indent=2,
+    )
+
+    method_results_path = Path(run_dir).parent / "partial_finetune_results.csv"
+    if method_results_path.exists():
+        method_results_df = pd.read_csv(method_results_path)
+        incoming_model_keys = set(results_df["model_key"])
+        method_results_df = method_results_df[
+            ~method_results_df["model_key"].isin(incoming_model_keys)
+        ]
+        method_results_df = pd.concat([method_results_df, results_df], ignore_index=True)
+    else:
+        method_results_df = results_df.copy()
+    method_results_df.to_csv(method_results_path, index=False)
+
+    with open(progress_dir / "metadata.json", "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2)
+
+
+def save_partial_finetune_checkpoint(run_dir, checkpoint_name, payload):
+    """Save a compact trainable-parameter checkpoint and return its path."""
+
+    checkpoint_dir = partial_finetune_progress_dir(run_dir) / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    path = checkpoint_dir / f"{checkpoint_name}.pt"
+    torch.save(payload, path)
+    return path
+
+
+def load_partial_finetune_checkpoint(path):
+    """Load a compact partial-fine-tuning checkpoint."""
+
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
