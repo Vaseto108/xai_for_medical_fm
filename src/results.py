@@ -1,4 +1,5 @@
 import json
+import shutil
 from pathlib import Path
 
 import pandas as pd
@@ -21,6 +22,60 @@ def make_run_dir(output_root, dataset_name, run_name, data_fraction=1.0, dataset
 def validate_save_request(save_outputs, data_fraction):
     if save_outputs and (data_fraction <= 0 or data_fraction > 1):
         raise ValueError("data_fraction must be in the interval (0, 1].")
+
+
+def selected_model_dir(run_dir):
+    """Return the shared directory for an XAI-ready selected model artifact."""
+
+    return Path(run_dir) / "selected_model"
+
+
+def save_selected_model_artifact(run_dir, manifest, state=None, source_state_path=None):
+    """Save one validation-selected model in the shared XAI artifact format.
+
+    ``state`` contains only the method-specific data needed to reconstruct the
+    selected predictor. ``source_state_path`` can copy an existing checkpoint
+    without loading it into memory. Exactly one of the two may be provided.
+    """
+
+    if state is not None and source_state_path is not None:
+        raise ValueError("Provide either state or source_state_path, not both.")
+
+    artifact_dir = selected_model_dir(run_dir)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    state_path = artifact_dir / "state.pt"
+
+    if source_state_path is not None:
+        shutil.copyfile(source_state_path, state_path)
+    elif state is not None:
+        torch.save(state, state_path)
+
+    saved_manifest = {
+        "artifact_version": 1,
+        **manifest,
+        "state_path": "state.pt" if state is not None or source_state_path is not None else None,
+    }
+    with open(artifact_dir / "manifest.json", "w", encoding="utf-8") as handle:
+        json.dump(saved_manifest, handle, indent=2)
+    return artifact_dir
+
+
+def load_selected_model_artifact(run_dir):
+    """Load the manifest and method-specific state for an XAI-ready model."""
+
+    artifact_dir = selected_model_dir(run_dir)
+    with open(artifact_dir / "manifest.json", "r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+
+    state = None
+    if manifest.get("state_path"):
+        state_path = artifact_dir / manifest["state_path"]
+        try:
+            state = torch.load(state_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            state = torch.load(state_path, map_location="cpu")
+
+    return manifest, state
 
 
 def feature_bank_path(run_dir):

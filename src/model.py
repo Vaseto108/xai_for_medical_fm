@@ -15,6 +15,9 @@ def _pool_dino_outputs(outputs):
 
 
 class DinoClassifier(nn.Module):
+    supports_gradcam = True
+    supports_occlusion = True
+
     def __init__(self, num_classes, model_name="facebook/dinov2-small", freeze_backbone=True):
         super().__init__()
         self.backbone = AutoModel.from_pretrained(model_name)
@@ -51,6 +54,63 @@ class FeatureLinearProbe(nn.Module):
         return self.classifier(features)
 
 
+class ImageLinearProbeClassifier(nn.Module):
+    """Reconstructed frozen-backbone linear probe for image-based XAI."""
+
+    supports_gradcam = True
+    supports_occlusion = True
+
+    def __init__(self, model_name, feature_dim, num_classes, normalize_features=True):
+        super().__init__()
+        self.backbone = AutoModel.from_pretrained(model_name)
+        self.classifier = nn.Linear(feature_dim, num_classes)
+        self.normalize_features = bool(normalize_features)
+
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+    def extract_features(self, images):
+        outputs = self.backbone(pixel_values=images)
+        features = _pool_dino_outputs(outputs)
+        if self.normalize_features:
+            features = F.normalize(features, dim=1)
+        return features
+
+    def forward(self, images):
+        return self.classifier(self.extract_features(images))
+
+
+class KNNImageClassifier(nn.Module):
+    """Frozen DINO backbone followed by a selected kNN reference bank."""
+
+    supports_gradcam = False
+    supports_occlusion = True
+
+    def __init__(self, model_name, reference_features, reference_labels, k):
+        super().__init__()
+        self.backbone = AutoModel.from_pretrained(model_name)
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        self.register_buffer(
+            "reference_features",
+            F.normalize(reference_features.float(), dim=1),
+        )
+        self.register_buffer("reference_labels", reference_labels.float())
+        self.k = min(int(k), int(reference_features.shape[0]))
+
+    def predict_proba(self, images):
+        outputs = self.backbone(pixel_values=images)
+        features = F.normalize(_pool_dino_outputs(outputs), dim=1)
+        similarities = features @ self.reference_features.T
+        neighbor_indices = similarities.topk(k=self.k, dim=1).indices
+        return self.reference_labels[neighbor_indices].mean(dim=1)
+
+    def forward(self, images):
+        probs = self.predict_proba(images)
+        return torch.logit(probs.clamp(1e-6, 1 - 1e-6))
+
+
 def get_dino_model(num_classes, model_name="facebook/dinov2-small", freeze_backbone=True):
     return DinoClassifier(
         num_classes=num_classes,
@@ -61,6 +121,63 @@ def get_dino_model(num_classes, model_name="facebook/dinov2-small", freeze_backb
 
 def get_feature_linear_probe(feature_dim, num_classes):
     return FeatureLinearProbe(feature_dim=feature_dim, num_classes=num_classes)
+
+
+def load_selected_model(run_dir, device="cpu"):
+    """Reconstruct a saved validation-selected predictor for XAI."""
+
+    from src.results import load_selected_model_artifact
+
+    manifest, state = load_selected_model_artifact(run_dir)
+    method = manifest["adaptation_method"]
+    model_name = manifest["model_name"]
+    num_classes = int(manifest["num_classes"])
+    if state is None:
+        raise ValueError(f"Selected-model artifact for {method} has no saved state.")
+
+    if method == "frozen_feature_knn":
+        model = KNNImageClassifier(
+            model_name=model_name,
+            reference_features=state["reference_features"],
+            reference_labels=state["reference_labels"],
+            k=int(manifest["selected_k"]),
+        )
+    elif method == "linear_probe":
+        model = ImageLinearProbeClassifier(
+            model_name=model_name,
+            feature_dim=int(manifest["feature_dim"]),
+            num_classes=num_classes,
+            normalize_features=manifest.get("normalize_features", True),
+        )
+        model.classifier.load_state_dict(state["classifier_state_dict"])
+    elif method == "partial_finetune":
+        model = get_dino_model(
+            num_classes=num_classes,
+            model_name=model_name,
+            freeze_backbone=True,
+        )
+        unfreeze_last_blocks(model, num_blocks=int(manifest["num_unfrozen_blocks"]))
+        incompatible = model.load_state_dict(state["trainable_state_dict"], strict=False)
+        if incompatible.unexpected_keys:
+            raise ValueError(
+                "Unexpected keys in selected partial-fine-tuning state: "
+                f"{incompatible.unexpected_keys}"
+            )
+        trainable_names = {
+            name for name, parameter in model.named_parameters() if parameter.requires_grad
+        }
+        missing_trainable = sorted(trainable_names.intersection(incompatible.missing_keys))
+        if missing_trainable:
+            raise ValueError(
+                "Selected partial-fine-tuning state is missing trainable keys: "
+                f"{missing_trainable}"
+            )
+    else:
+        raise ValueError(f"Unsupported selected-model adaptation method: {method}")
+
+    model = model.to(device)
+    model.eval()
+    return model, manifest
 
 
 def get_dino_backbone(model_name="facebook/dinov2-small", freeze=True):

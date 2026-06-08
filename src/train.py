@@ -135,6 +135,13 @@ def _peak_memory_mb(device):
     return torch.cuda.max_memory_allocated(device) / 1024**2
 
 
+def _state_dict_cpu(module):
+    return {
+        name: tensor.detach().cpu().clone()
+        for name, tensor in module.state_dict().items()
+    }
+
+
 def train_model(model, train_loader, val_loader, device, epochs=3, lr=1e-3, weight_decay=0.0):
     criterion = nn.BCEWithLogitsLoss()
     trainable_params = [param for param in model.parameters() if param.requires_grad]
@@ -971,6 +978,7 @@ def train_feature_linear_probe_checkpoints(
                 "probs": val_probs,
                 "labels": val_targets,
                 "val_eval_seconds": float(val_eval_seconds),
+                "classifier_state_dict": _state_dict_cpu(model.classifier),
             }
 
     return history, checkpoints
@@ -1034,7 +1042,7 @@ def _trainable_state_dict(model):
         name for name, parameter in model.named_parameters() if parameter.requires_grad
     }
     return {
-        name: tensor.detach().cpu()
+        name: tensor.detach().cpu().clone()
         for name, tensor in model.state_dict().items()
         if name in trainable_names
     }
@@ -1066,12 +1074,14 @@ def _run_partial_finetune_stage(
     completed_results_df=None,
     completed_history_df=None,
     completed_trials_df=None,
+    capture_selected_state=False,
 ):
     trial_frames = [completed_trials_df]
     history_frames = [completed_history_df]
     result_frames = [completed_results_df]
     probs_by_checkpoint = {}
     labels_by_checkpoint = {}
+    selected_state_by_config = {}
     timing = {
         "model_init_seconds": 0.0,
         "partial_train_seconds": 0.0,
@@ -1132,11 +1142,12 @@ def _run_partial_finetune_stage(
         trial_model_metadata = model_metadata(model)
         best_checkpoint_key = None
         best_checkpoint_path = None
+        best_checkpoint_state = None
 
         train_start = time.perf_counter()
 
         def save_best_checkpoint(epoch, checkpoint):
-            nonlocal best_checkpoint_key, best_checkpoint_path
+            nonlocal best_checkpoint_key, best_checkpoint_path, best_checkpoint_state
 
             checkpoint_thresholds_df = threshold_metric_table(
                 checkpoint["probs"],
@@ -1153,27 +1164,31 @@ def _run_partial_finetune_stage(
             ):
                 return
             best_checkpoint_key = checkpoint_key
-            if progress_run_dir is None:
+            if progress_run_dir is None and not capture_selected_state:
                 return
 
-            best_checkpoint_path = save_partial_finetune_checkpoint(
-                progress_run_dir,
-                checkpoint_name=f"{config_key}_best",
-                payload={
-                    "model_name": model_name,
-                    "stage": stage,
-                    "config_key": config_key,
-                    "train_trial_id": train_trial_id,
-                    "epoch": int(epoch),
-                    "selection_metric": selection_metric,
-                    "selection_metric_value": checkpoint_key[0],
-                    "selected_threshold": float(checkpoint_best["threshold"]),
-                    "config": config,
-                    "trainable_state_dict": _trainable_state_dict(model),
-                    "probs": checkpoint["probs"],
-                    "labels": checkpoint["labels"],
-                },
-            )
+            checkpoint_payload = {
+                "model_name": model_name,
+                "stage": stage,
+                "config_key": config_key,
+                "train_trial_id": train_trial_id,
+                "epoch": int(epoch),
+                "selection_metric": selection_metric,
+                "selection_metric_value": checkpoint_key[0],
+                "selected_threshold": float(checkpoint_best["threshold"]),
+                "config": config,
+                "trainable_state_dict": _trainable_state_dict(model),
+                "probs": checkpoint["probs"],
+                "labels": checkpoint["labels"],
+            }
+            if capture_selected_state:
+                best_checkpoint_state = checkpoint_payload
+            if progress_run_dir is not None:
+                best_checkpoint_path = save_partial_finetune_checkpoint(
+                    progress_run_dir,
+                    checkpoint_name=f"{config_key}_best",
+                    payload=checkpoint_payload,
+                )
 
         history, checkpoints = train_partial_finetune_checkpoints(
             model,
@@ -1309,6 +1324,9 @@ def _run_partial_finetune_stage(
                 },
             )
 
+        if capture_selected_state and best_checkpoint_state is not None:
+            selected_state_by_config[config_key] = best_checkpoint_state
+
         del model
         gc.collect()
         if _is_cuda_device(device):
@@ -1332,6 +1350,7 @@ def _run_partial_finetune_stage(
         "results": cumulative_results_df,
         "probs_by_checkpoint": probs_by_checkpoint,
         "labels_by_checkpoint": labels_by_checkpoint,
+        "selected_state_by_config": selected_state_by_config,
         "timing": timing,
     }
 
@@ -1359,7 +1378,8 @@ def run_partial_finetune_grid(
 
     The search stage compares every block/LR/weight-decay configuration using
     short checkpoint epochs. The selected structural/training configuration is
-    then initialized from scratch and trained through ``checkpoint_epochs``.
+    then reloaded from the original pretrained backbone and trained through
+    ``checkpoint_epochs``.
     Search, final-run, and total measured costs are all returned explicitly.
     """
 
@@ -1415,6 +1435,7 @@ def run_partial_finetune_grid(
         completed_results_df=completed_results_df,
         completed_history_df=completed_history_df,
         completed_trials_df=completed_trials_df,
+        capture_selected_state=False,
     )
     search_trials_df = search_result["trials"]
     search_trials_df = search_trials_df[search_trials_df["stage"] == "search"]
@@ -1448,6 +1469,7 @@ def run_partial_finetune_grid(
         completed_results_df=search_result["results"],
         completed_history_df=search_result["history"],
         completed_trials_df=search_result["trials"],
+        capture_selected_state=True,
     )
     final_trials_df = final_result["trials"]
     final_trials_df = final_trials_df[final_trials_df["stage"] == "final"]
@@ -1457,6 +1479,18 @@ def run_partial_finetune_grid(
     best_trial_id = final_best["trial_id"]
     best_epoch = int(final_best["epoch"])
     best_threshold = float(final_best["threshold"])
+    selected_checkpoint_path = final_best.get("checkpoint_path")
+    if pd.isna(selected_checkpoint_path):
+        selected_checkpoint_path = None
+    selected_checkpoint_state = final_result["selected_state_by_config"].get(
+        final_best["config_key"]
+    )
+    if selected_checkpoint_state is None and selected_checkpoint_path:
+        selected_checkpoint_state = load_partial_finetune_checkpoint(
+            selected_checkpoint_path
+        )
+    if selected_checkpoint_state is None:
+        raise ValueError("Selected final partial-fine-tuning weights are unavailable.")
     best_context = {
         **(context or {}),
         "stage": "final",
@@ -1562,6 +1596,7 @@ def run_partial_finetune_grid(
         "selected_weight_decay": float(final_best["weight_decay"]),
         "selected_threshold": best_threshold,
         "selected_metric_value": float(final_best[selection_metric]),
+        "selected_checkpoint_path": selected_checkpoint_path,
         "selected_total_transformer_blocks": int(final_best["total_transformer_blocks"]),
         "selected_block_path": final_best["block_path"],
         "selected_final_norm_path": final_best["final_norm_path"],
@@ -1573,6 +1608,9 @@ def run_partial_finetune_grid(
         "summary": pd.DataFrame([final_best.to_dict()]),
         "per_class": per_class_df,
         "metadata": metadata,
+        "selected_trainable_state_dict": selected_checkpoint_state[
+            "trainable_state_dict"
+        ],
     }
 
 
@@ -1621,6 +1659,7 @@ def run_linear_probe_grid(
     history_frames = []
     probs_by_checkpoint = {}
     labels_by_checkpoint = {}
+    classifier_state_by_checkpoint = {}
     total_head_train_seconds = 0.0
     total_checkpoint_eval_seconds = 0.0
     total_threshold_search_seconds = 0.0
@@ -1699,6 +1738,9 @@ def run_linear_probe_grid(
 
             probs_by_checkpoint[(train_trial_id, int(epoch))] = checkpoint["probs"]
             labels_by_checkpoint[(train_trial_id, int(epoch))] = checkpoint["labels"]
+            classifier_state_by_checkpoint[(train_trial_id, int(epoch))] = checkpoint[
+                "classifier_state_dict"
+            ]
 
         history_frames.append(_with_context(pd.DataFrame(history), train_context))
 
@@ -1777,6 +1819,9 @@ def run_linear_probe_grid(
         "summary": pd.DataFrame([best.to_dict()]),
         "per_class": per_class_df,
         "metadata": metadata,
+        "selected_classifier_state_dict": classifier_state_by_checkpoint[
+            (best_train_trial_id, best_epoch)
+        ],
     }
 
 
