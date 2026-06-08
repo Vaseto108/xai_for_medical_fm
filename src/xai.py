@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+import time
 
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
@@ -90,55 +91,214 @@ def make_attention_rollout(
     raise NotImplementedError("Attention rollout is planned but not implemented yet.")
 
 
-def dice_score(heatmap, mask, threshold=0.5, eps=1e-7):
-    """Planned Dice score between a thresholded heatmap and binary mask.
+def dice_score(heatmap: torch.Tensor, mask: torch.Tensor, threshold=0.5, eps=1e-7) -> float:
+    """Dice coefficient between thresholded heatmap and binary mask."""
+    pred = (heatmap >= threshold).float()
+    gt = (mask > 0).float()
+    intersection = (pred * gt).sum()
+    return float((2 * intersection / (pred.sum() + gt.sum() + eps)).item())
+
+
+def iou_score(heatmap: torch.Tensor, mask: torch.Tensor, threshold=0.5, eps=1e-7) -> float:
+    """IoU between thresholded heatmap and binary mask."""
+    pred = (heatmap >= threshold).float()
+    gt = (mask > 0).float()
+    intersection = (pred * gt).sum()
+    union = (pred + gt).clamp(max=1).sum()
+    return float((intersection / (union + eps)).item())
+
+
+def pointing_game_score(heatmap: torch.Tensor, mask: torch.Tensor) -> float:
+    """Pointing Game: hit if the argmax pixel falls inside the binary mask.
 
     Args:
-        heatmap: Explanation map, typically Tensor[H, W] or Tensor[B, H, W].
-        mask: Ground-truth localization mask with a broadcast-compatible shape.
-        threshold: Heatmap cutoff used to create a binary prediction mask.
-        eps: Small value to avoid division by zero.
+        heatmap: Tensor[H, W], values in [0, 1].
+        mask: Binary Tensor[H, W] (1 = annotated region).
 
     Returns:
-        Float Dice score.
+        1.0 for a hit, 0.0 for a miss.
     """
+    heatmap = heatmap.float()
+    mask = (mask > 0).float()
+    idx = heatmap.argmax()
+    row, col = idx // heatmap.shape[1], idx % heatmap.shape[1]
+    return float(mask[row, col].item())
 
-    raise NotImplementedError("Dice scoring for XAI masks is planned but not implemented yet.")
 
+def deletion_auc(
+    model,
+    image,
+    heatmap,
+    target_class,
+    device,
+    n_steps=100,
+    baseline_value=0.0,
+):
+    """Deletion AUC faithfulness metric.
 
-def iou_score(heatmap, mask, threshold=0.5, eps=1e-7):
-    """Planned IoU score between a thresholded heatmap and binary mask.
+    Removes pixels in descending saliency order, measures the target-class
+    probability at each step, and returns the area under that curve.
+    Lower = more faithful (confidence drops faster).
 
     Args:
-        heatmap: Explanation map, typically Tensor[H, W] or Tensor[B, H, W].
-        mask: Ground-truth localization mask with a broadcast-compatible shape.
-        threshold: Heatmap cutoff used to create a binary prediction mask.
-        eps: Small value to avoid division by zero.
+        model: Classification model.
+        image: Tensor[3, H, W], normalized.
+        heatmap: Tensor[H, W] saliency map aligned to image.
+        target_class: Integer class index.
+        device: torch device.
+        n_steps: Number of deletion steps (default 100).
+        baseline_value: Scalar fill value (default 0.0 = normalized mean).
 
     Returns:
-        Float intersection-over-union score.
+        Float AUC value.
     """
+    model.eval()
+    _, H, W = image.shape
+    n_pixels = H * W
 
-    raise NotImplementedError("IoU scoring for XAI masks is planned but not implemented yet.")
+    flat_saliency = heatmap.view(-1)
+    sorted_indices = flat_saliency.argsort(descending=True)
+
+    step_fractions = np.linspace(0, 1, n_steps + 1)
+    scores = []
+
+    inp = image.clone().to(device)
+
+    with torch.no_grad():
+        for frac in step_fractions:
+            n_removed = int(frac * n_pixels)
+            masked = inp.clone()
+            if n_removed > 0:
+                remove_idx = sorted_indices[:n_removed]
+                rows = remove_idx // W
+                cols = remove_idx % W
+                masked[:, rows, cols] = baseline_value
+            prob = torch.sigmoid(model(masked.unsqueeze(0)))[0, target_class].item()
+            scores.append(prob)
+
+    return float(np.trapz(scores, step_fractions))
 
 
-def pointing_game_score(heatmap, mask):
-    """Planned pointing-game score for XAI localization.
+def insertion_auc(
+    model,
+    image,
+    heatmap,
+    target_class,
+    device,
+    n_steps=100,
+    baseline_value=0.0,
+):
+    """Insertion AUC (complementary to Deletion AUC).
 
-    The future implementation should check whether the maximum heatmap location
-    falls inside the ground-truth mask for the explained class.
+    Reveals pixels in descending saliency order from a fully masked baseline.
+    Higher = more faithful.
+
+    Returns:
+        Float AUC value.
+    """
+    model.eval()
+    _, H, W = image.shape
+    n_pixels = H * W
+
+    flat_saliency = heatmap.view(-1)
+    sorted_indices = flat_saliency.argsort(descending=True)
+
+    step_fractions = np.linspace(0, 1, n_steps + 1)
+    scores = []
+
+    inp = image.clone().to(device)
+
+    with torch.no_grad():
+        for frac in step_fractions:
+            n_revealed = int(frac * n_pixels)
+            masked = torch.full_like(inp, baseline_value)
+            if n_revealed > 0:
+                reveal_idx = sorted_indices[:n_revealed]
+                rows = reveal_idx // W
+                cols = reveal_idx % W
+                masked[:, rows, cols] = inp[:, rows, cols]
+            prob = torch.sigmoid(model(masked.unsqueeze(0)))[0, target_class].item()
+            scores.append(prob)
+
+    return float(np.trapz(scores, step_fractions))
+
+
+def max_sensitivity(
+    model,
+    image,
+    target_class,
+    heatmap_fn,
+    device,
+    epsilon=0.1,
+    n_perturbations=20,
+    seed=0,
+):
+    """Max-Sensitivity stability metric.
+
+    Estimates the maximum change in the saliency map under small input
+    perturbations:
+        Sens = max_{||delta|| < epsilon} ||S(x+delta) - S(x)|| / ||delta||
 
     Args:
-        heatmap: Explanation map, typically Tensor[H, W].
-        mask: Binary ground-truth mask aligned to the heatmap.
+        heatmap_fn: Callable(model, image, target_class, device) -> Tensor[H, W].
+        epsilon: L-inf perturbation bound.
+        n_perturbations: Number of random perturbations.
 
     Returns:
-        1.0 for a hit, 0.0 for a miss, or an aggregate score for batches.
+        Float max-sensitivity value.
     """
+    rng = torch.Generator()
+    rng.manual_seed(seed)
 
-    raise NotImplementedError(
-        "Pointing-game scoring for XAI masks is planned but not implemented yet."
-    )
+    base_heatmap = heatmap_fn(model, image, target_class, device).float()
+
+    max_sens = 0.0
+    for _ in range(n_perturbations):
+        delta = torch.empty_like(image).uniform_(-epsilon, epsilon, generator=rng)
+        perturbed = (image + delta).clamp(0, 1)
+        pert_heatmap = heatmap_fn(model, perturbed, target_class, device).float()
+
+        heatmap_diff = (pert_heatmap - base_heatmap).norm()
+        delta_norm = delta.norm()
+        if delta_norm > 0:
+            sens = (heatmap_diff / delta_norm).item()
+            max_sens = max(max_sens, sens)
+
+    return max_sens
+
+
+def measure_heatmap_time(
+    model,
+    image,
+    target_class,
+    heatmap_fn,
+    device,
+    n_warmup=2,
+    n_runs=5,
+):
+    """Measure wall-clock time for a single heatmap generation (ms).
+
+    Args:
+        heatmap_fn: Callable(model, image, target_class, device) -> Tensor[H, W].
+
+    Returns:
+        Float mean time in milliseconds.
+    """
+    for _ in range(n_warmup):
+        heatmap_fn(model, image, target_class, device)
+
+    if torch.device(device).type == "cuda":
+        torch.cuda.synchronize()
+
+    times = []
+    for _ in range(n_runs):
+        t0 = time.perf_counter()
+        heatmap_fn(model, image, target_class, device)
+        if torch.device(device).type == "cuda":
+            torch.cuda.synchronize()
+        times.append((time.perf_counter() - t0) * 1000)
+
+    return float(np.mean(times))
 
 
 def _image_for_display(image):
