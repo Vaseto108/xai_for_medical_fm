@@ -32,113 +32,142 @@ def make_heatmap(model, image, target_class, device):
 
 
 def make_gradcam_heatmap(model, image, target_class, target_layer=None, device=None):
-    """Planned Grad-CAM heatmap for a target class.
+    model.eval()
+    image = image.unsqueeze(0).to(device)
 
-    Args:
-        model: Classification model that produces logits from images.
-        image: Single normalized image tensor with shape [3, H, W].
-        target_class: Integer class index to explain.
-        target_layer: Model layer/module to hook for Grad-CAM activations.
-        device: Optional torch device for the forward/backward pass.
+    # Default: hook the last transformer block
+    if target_layer is None:
+        target_layer = model.backbone.blocks[-1].norm1
 
-    Returns:
-        Tensor[H, W] normalized to [0, 1].
-    """
+    gradients, activations = [], []
 
-    raise NotImplementedError("Grad-CAM heatmap generation is planned but not implemented yet.")
+    fh = target_layer.register_forward_hook(lambda m, i, o: activations.append(o.detach()))
+    bh = target_layer.register_full_backward_hook(lambda m, gi, go: gradients.append(go[0].detach()))
 
+    logits = model(image)
+    model.zero_grad()
+    logits[0, target_class].backward()
 
-def make_occlusion_heatmap(
-    model,
-    image,
-    target_class,
-    device=None,
-    patch_size=16,
-    stride=8,
-    baseline=0.0,
-):
-    """Planned occlusion sensitivity heatmap for a target class.
+    fh.remove()
+    bh.remove()
 
-    The future implementation should slide an occluding patch over the image and
-    measure the target-class score change at each location.
+    grad = gradients[0]   # (1, seq_len, dim)
+    act  = activations[0] # (1, seq_len, dim)
 
-    Returns:
-        Tensor[H, W] normalized to [0, 1].
-    """
+    weights = grad.mean(dim=-1, keepdim=True)      # importance per token
+    cam = (weights * act).sum(dim=-1)              # (1, seq_len)
+    cam = cam[:, 1:]                               # drop CLS token
 
-    raise NotImplementedError(
-        "Occlusion sensitivity heatmap generation is planned but not implemented yet."
-    )
+    grid = int(cam.shape[1] ** 0.5)
+    cam = cam.reshape(1, 1, grid, grid)
+
+    H, W = image.shape[-2:]
+    cam = torch.nn.functional.interpolate(cam, size=(H, W), mode="bilinear", align_corners=False)
+    cam = cam.squeeze()
+    cam = torch.clamp(cam, min=0)
+    return _normalize_heatmap(cam.cpu())
 
 
-def make_attention_rollout(
-    model,
-    image,
-    device=None,
-    head_fusion="mean",
-    discard_ratio=0.0,
-):
-    """Planned attention rollout heatmap for ViT/DINO-style backbones.
+def make_occlusion_heatmap(model, image, target_class, device=None, patch_size=16, stride=8, baseline=0.0):
+    model.eval()
+    C, H, W = image.shape
+    img_batch = image.unsqueeze(0).to(device)
 
-    The future implementation should aggregate transformer attention maps into a
-    spatial explanation aligned to the input image.
+    with torch.no_grad():
+        baseline_score = torch.sigmoid(model(img_batch))[0, target_class].item()
 
-    Returns:
-        Tensor[H, W] normalized to [0, 1].
-    """
+    score_map = np.zeros((H, W), dtype=np.float32)
+    count_map = np.zeros((H, W), dtype=np.float32)
 
-    raise NotImplementedError("Attention rollout is planned but not implemented yet.")
+    for y in range(0, H - patch_size + 1, stride):
+        for x in range(0, W - patch_size + 1, stride):
+            occluded = img_batch.clone()
+            occluded[:, :, y:y + patch_size, x:x + patch_size] = baseline
+
+            with torch.no_grad():
+                score = torch.sigmoid(model(occluded))[0, target_class].item()
+
+            drop = baseline_score - score          # positive = region mattered
+            score_map[y:y + patch_size, x:x + patch_size] += drop
+            count_map[y:y + patch_size, x:x + patch_size] += 1
+
+    count_map = np.maximum(count_map, 1)
+    score_map /= count_map
+    score_map = torch.tensor(score_map)
+    return _normalize_heatmap(score_map)           # reuses existing helper
+
+
+def make_attention_rollout(model, image, device=None, head_fusion="mean", discard_ratio=0.0):
+    model.eval()
+    image = image.unsqueeze(0).to(device)
+
+    attention_maps = []
+
+    def hook_fn(module, input, output):
+        # DINOv2 attention blocks return (attn_output, attn_weights) or just attn_output
+        # depending on the variant — adjust if needed
+        attention_maps.append(output.detach())
+
+    hooks = []
+    for block in model.backbone.blocks:
+        hooks.append(block.attn.register_forward_hook(hook_fn))
+
+    with torch.no_grad():
+        model(image)
+
+    for h in hooks:
+        h.remove()
+
+    # Rollout
+    result = torch.eye(attention_maps[0].shape[-1], device=device)
+    for attn in attention_maps:
+        if head_fusion == "mean":
+            attn = attn.mean(dim=1)
+        elif head_fusion == "max":
+            attn = attn.max(dim=1).values
+        elif head_fusion == "min":
+            attn = attn.min(dim=1).values
+
+        # Discard low-attention tokens
+        flat = attn.view(attn.shape[0], -1)
+        threshold = flat.quantile(discard_ratio, dim=-1, keepdim=True)
+        attn = torch.where(attn >= threshold.unsqueeze(-1), attn, torch.zeros_like(attn))
+
+        # Add residual and renormalize
+        attn = attn + torch.eye(attn.shape[-1], device=device)
+        attn = attn / attn.sum(dim=-1, keepdim=True)
+        result = attn[0] @ result
+
+    # CLS token row → attention from CLS to all patches
+    mask = result[0, 1:]                           # drop CLS-to-CLS
+    grid = int(mask.shape[0] ** 0.5)
+    mask = mask.reshape(1, 1, grid, grid)
+
+    H, W = image.shape[-2:]
+    mask = torch.nn.functional.interpolate(mask, size=(H, W), mode="bilinear", align_corners=False)
+    mask = mask.squeeze()
+    return _normalize_heatmap(mask.cpu())
 
 
 def dice_score(heatmap, mask, threshold=0.5, eps=1e-7):
-    """Planned Dice score between a thresholded heatmap and binary mask.
-
-    Args:
-        heatmap: Explanation map, typically Tensor[H, W] or Tensor[B, H, W].
-        mask: Ground-truth localization mask with a broadcast-compatible shape.
-        threshold: Heatmap cutoff used to create a binary prediction mask.
-        eps: Small value to avoid division by zero.
-
-    Returns:
-        Float Dice score.
-    """
-
-    raise NotImplementedError("Dice scoring for XAI masks is planned but not implemented yet.")
+    pred = (heatmap >= threshold).float()
+    mask = mask.float()
+    intersection = (pred * mask).sum()
+    return (2 * intersection + eps) / (pred.sum() + mask.sum() + eps)
 
 
 def iou_score(heatmap, mask, threshold=0.5, eps=1e-7):
-    """Planned IoU score between a thresholded heatmap and binary mask.
-
-    Args:
-        heatmap: Explanation map, typically Tensor[H, W] or Tensor[B, H, W].
-        mask: Ground-truth localization mask with a broadcast-compatible shape.
-        threshold: Heatmap cutoff used to create a binary prediction mask.
-        eps: Small value to avoid division by zero.
-
-    Returns:
-        Float intersection-over-union score.
-    """
-
-    raise NotImplementedError("IoU scoring for XAI masks is planned but not implemented yet.")
+    pred = (heatmap >= threshold).float()
+    mask = mask.float()
+    intersection = (pred * mask).sum()
+    union = pred.sum() + mask.sum() - intersection
+    return (intersection + eps) / (union + eps)
 
 
 def pointing_game_score(heatmap, mask):
-    """Planned pointing-game score for XAI localization.
-
-    The future implementation should check whether the maximum heatmap location
-    falls inside the ground-truth mask for the explained class.
-
-    Args:
-        heatmap: Explanation map, typically Tensor[H, W].
-        mask: Binary ground-truth mask aligned to the heatmap.
-
-    Returns:
-        1.0 for a hit, 0.0 for a miss, or an aggregate score for batches.
-    """
-
-    raise NotImplementedError(
-        "Pointing-game scoring for XAI masks is planned but not implemented yet."
-    )
+    peak = heatmap.argmax()                        # flat index of max activation
+    peak_coords = torch.unravel_index(peak, heatmap.shape)
+    return float(mask[peak_coords].item() > 0)
 
 
 def _image_for_display(image):
